@@ -1,0 +1,22 @@
+input:
+  raw_root: ".."
+  year_directories:
+    2021: "unused"
+  filename_pattern: "*.csv"
+  ports_csv: "../UpdatedPub150.csv"
+
+storage:
+  work_root: "../work/local-validation"
+  temp_directory: "../work/local-validation/tmp"
+
+runtime:
+  threads: 4
+  memory_limit: "4GB"
+  enable_progress: true
+  progress_bar_time_ms: 500
+
+split:
+  dynamic_message_types: [1, 2, 3, 18, 19, 27]
+  static_message_types: [5, 24]
+  compression: "zstd"
+  row_group_size: 10000

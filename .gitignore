@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local configuration and credentials
+.env
+configs/production.yaml
+
+# AIS source data and generated artifacts
+*.csv
+*.parquet
+*.duckdb
+*.duckdb.wal
+work/
+derived/
+outputs/
+manifests/
+rejects/
+logs/
+tmp/
+
+# Keep small test fixtures when explicitly added later
+!tests/fixtures/*.csv

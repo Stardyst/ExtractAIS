@@ -1,0 +1,23 @@
+input:
+  raw_root: "E:/AIS2021-2022"
+  year_directories:
+    2021: "2021"
+    2022: "2022"
+  filename_pattern: "*.csv"
+  ports_csv: "E:/AIS2021-2022/UpdatedPub150.csv"
+
+storage:
+  work_root: "E:/AIS2021-2022/derived"
+  temp_directory: "E:/AIS2021-2022/derived/tmp"
+
+runtime:
+  threads: 20
+  memory_limit: "100GB"
+  enable_progress: true
+  progress_bar_time_ms: 2000
+
+split:
+  dynamic_message_types: [1, 2, 3, 18, 19, 27]
+  static_message_types: [5, 24]
+  compression: "zstd"
+  row_group_size: 1000000
