@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "extractais"
-version = "0.1.0"
+version = "1.0.0"
 description = "Auditable preprocessing of large AIS archives"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "duckdb>=1.4,<1.5",
   "PyYAML>=6.0,<7",

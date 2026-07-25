@@ -1,55 +1,85 @@
-# ExtractAIS processing pipeline
+# ExtractAIS pipeline contract
 
-## Data scale and execution model
+## Execution model
 
-The production archive contains daily files under `2021/` and `2022/`, each
-roughly 8 GB. Bulk transformations must use vectorized DuckDB SQL and Parquet;
-Python coordinates work units and never iterates over individual AIS rows.
+The production archive contains daily CSV files under `2021/` and `2022/`, approximately 6.24 TB in total. DuckDB performs every row-level transformation and may spill to the configured work disk. Python only inventories files, divides work into bounded units and commits checkpoints.
 
-All stages are restartable. A stage writes temporary artifacts first, replaces
-the final artifact atomically, then updates its manifest. Aggregate progress is
-shown by input bytes, month or MMSI bucket. DuckDB reports progress for the
-active query.
+Every work unit follows the same transaction pattern:
 
-## Stages
+1. Compare the input identity, stage-specific configuration hash and required output files with the manifest.
+2. Write to a sibling `.tmp` file or directory.
+3. Close DuckDB and atomically replace the final output.
+4. Record the Git commit, row counts where practical, elapsed time and completion timestamp.
 
-1. Inventory source files and verify date continuity.
-2. Parse each CSV once and immediately separate dynamic and static messages.
-3. Repartition dynamic Parquet by MMSI hash and sort each bucket by MMSI/time.
-4. Generate stop events and data-supported port anchors.
-5. Build port groups and 3/4/10 km multi-anchor geofences.
-6. Match near-port points through a coarse spatial tile and exact distance.
-7. Confirm port calls, construct voyages and assign the five spatial states.
-8. Compress consecutive states to intervals and split only at year boundaries.
-9. Produce port-level metrics, ambiguous events and stratified review samples.
+An interrupted active unit restarts; completed units are skipped.
 
-## Stage 1 outputs
+## Data stages
 
-Dynamic and static records are written separately under:
+### Stage 01: split
 
-```text
-stage01_split/dynamic/year=YYYY/month=MM/day=DD/part.parquet
-stage01_split/static/year=YYYY/month=MM/day=DD/part.parquet
-```
+Each CSV is parsed once with all raw columns initially treated as text. Sentinels are normalized, and rows are separated into dynamic message types 1/2/3/18/19/27 and static types 5/24. Dynamic validity requires timestamp, nine-digit MMSI and valid coordinates. Static validity requires timestamp and MMSI.
 
-The dynamic table contains only message types 1, 2, 3, 18, 19 and 27 with a
-valid UTC timestamp, nine-digit MMSI and valid coordinates. AIS unavailable
-sentinels are converted to null. Static message types 5 and 24 require a valid
-UTC timestamp and MMSI. Other message types are counted but not exported.
+Source `matchedPortName`, `label`, `sublabel`, `at_dock`, source and collection type remain evidence only. They never directly determine the computed state.
 
-Source-provided `matchedPortName`, `label`, `sublabel` and `at_dock` are retained
-in the dynamic output solely as validation evidence.
+### Stage 02 and 03: prepare tracks
 
-## Disk budget
+Static messages are reduced to one row per MMSI using the latest non-null value of each field, with first/last timestamps and message count retained.
 
-The 4.48 TB work volume must not be committed to a full run until the two-month
-pilot measures dynamic Parquet size and external-sort temporary space. Stage
-manifests report output rows and elapsed time per day so the full-run estimate is
-based on observed throughput.
+Dynamic Parquet is scanned once per month and physically partitioned by `mmsi % bucket_count`. Each resulting bucket is then read across all months, exactly deduplicated, sorted by MMSI/time and assigned a per-vessel point sequence. Same-time coordinate conflicts and implied speeds above the configured limit are flagged.
 
-## Port validation contract
+### Stage 04: stop events
 
-The port stage must preserve anchor support, the three closest port candidates,
-distance margins, entry/exit evidence, source-label agreement and ambiguity
-flags. Metrics are stratified by WPI Harbor Size. Removing `Very Small` ports is
-a catalog decision after review and must not require reparsing source CSV.
+A stop candidate is a low-speed point or a point with missing speed and a sufficiently short step. Consecutive candidates are split on the configured point gap. A run is retained only if its duration and bounding-box diameter satisfy the stop thresholds. The event retains its centroid, extent, speed statistics, point count and source `at_dock` support.
+
+### Stage 05: ports and anchors
+
+WPI rows with invalid coordinates or an excluded Harbor Size are removed. Port centers separated by no more than `group_distance_km` are unioned through connected components. Every member remains in `port_catalog`; recognition outputs the shared `port_group_id`.
+
+Stop centroids are aggregated on the anchor grid. Cells must meet minimum stop-event and distinct-vessel support. Each qualified cell is assigned to the nearest WPI member within `anchor_assignment_radius_km`. The assigned cells become multi-circle anchor centers. Stops within the entry radius of an anchor form independent port-call evidence.
+
+A 0.1-degree lookup table maps AIS `geo_tile` values to possible anchors. Exact Haversine distance is always applied after the coarse join.
+
+### Stage 06: candidates and port calls
+
+For each near-port point, the minimum exact distance to every candidate port group is retained and ranked. Consecutive rank-one points for the same group form an approach episode; missing points, group changes and excessive point gaps split episodes.
+
+An episode becomes a confirmed port call only when it:
+
+- has at least the configured number of points;
+- reaches the entry radius and has an exit-radius observation; and
+- overlaps an independently detected and port-matched stop event.
+
+The candidate and port-call files preserve source labels, distance margins and evidence counts for audit. Source `at_dock` and port labels do not confirm a call, so they remain independent comparison evidence.
+
+### Stage 07: states and annual intervals
+
+Each valid track point is attached to its most recent and next confirmed port call using temporal ASOF joins. Classification precedence is:
+
+1. Between a confirmed call's entry and exit: `IN_PORT`.
+2. Within the approach radius of the previous call: `DEPARTING`.
+3. Within the approach radius of the next call: `ARRIVING`.
+4. Otherwise: `OCEAN`.
+
+If previous and next approach zones both contain the point, the nearer group determines the direction. Consecutive equal state/from/to points are compressed. Gaps above the configured threshold are emitted separately as `UNKNOWN_GAP`. Segments crossing January 1 are clipped into separate annual rows.
+
+The output intentionally excludes endpoint coordinates, duration and route distance.
+
+## Validation contract
+
+The following evidence must remain available before any Harbor Size is excluded:
+
+- port-group membership and member count;
+- anchor location, stop-event support, vessel support and WPI-center distance;
+- qualified but unmatched stop-anchor candidates;
+- every near-port candidate group and exact distance rank;
+- first/second candidate margin;
+- matched stop count and source-label support for each call;
+- port-level call count, calling-vessel count and ambiguity rate;
+- Harbor Size-stratified coverage and quality;
+- annual state and quality-flag counts.
+
+`Very Small` removal is a catalog-configuration change. It invalidates stages 05 onward but does not invalidate CSV parsing, static compaction, track preparation or stop detection.
+
+## Known first-version boundary
+
+AIS gaps longer than the threshold are never inferred. Short gaps may remain inside an observed event, but the pipeline does not yet probabilistically reconstruct missing positions or visits. This keeps first-version labels auditable and provides a clean base for a later inference stage.

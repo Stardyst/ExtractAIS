@@ -2,6 +2,7 @@ input:
   raw_root: ".."
   year_directories:
     2021: "unused"
+    2022: "unused"
   filename_pattern: "*.csv"
   ports_csv: "../UpdatedPub150.csv"
 
@@ -20,3 +21,33 @@ split:
   static_message_types: [5, 24]
   compression: "zstd"
   row_group_size: 10000
+
+prepare:
+  mmsi_buckets: 8
+  compression: "zstd"
+  row_group_size: 10000
+  max_implied_speed_knots: 80
+
+stops:
+  max_speed_knots: 0.5
+  max_step_km: 0.25
+  max_point_gap_minutes: 60
+  min_duration_minutes: 60
+  max_diameter_km: 1.0
+
+ports:
+  entry_radius_km: 3
+  exit_radius_km: 4
+  approach_radius_km: 10
+  group_distance_km: 4
+  anchor_assignment_radius_km: 20
+  anchor_grid_degrees: 0.005
+  anchor_min_stop_events: 1
+  anchor_min_vessels: 1
+  call_min_points: 2
+  call_max_point_gap_hours: 6
+  ambiguity_margin_km: 1
+  excluded_harbor_sizes: []
+
+intervals:
+  unknown_gap_hours: 6

@@ -12,6 +12,7 @@ from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql, sql_literal
 from extractais.gitmeta import git_commit
 from extractais.inventory import InputFile
+from extractais.fileutils import temporary_file
 from extractais.manifest import load_split_manifest, write_json_atomic
 from extractais.schema import (
     DYNAMIC_SELECT,
@@ -31,10 +32,6 @@ def _output_paths(work_root: Path, item: InputFile) -> tuple[Path, Path]:
     return dynamic, static
 
 
-def _temporary(path: Path) -> Path:
-    return path.with_name(path.stem + ".tmp" + path.suffix)
-
-
 def _count(connection, sql: str) -> int:
     return int(connection.execute(f"SELECT count(*) FROM ({sql})").fetchone()[0])
 
@@ -52,7 +49,8 @@ def split_files(
 
     manifest_path = config.storage.work_root / "manifests" / "split.json"
     manifest = load_split_manifest(manifest_path)
-    manifest["config_hash"] = config.config_hash
+    stage_hash = config.stage_hash("input", "split")
+    manifest["config_hash"] = stage_hash
     manifest["git_commit"] = git_commit(project_root)
     manifest["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
 
@@ -76,7 +74,7 @@ def split_files(
                 previous
                 and previous.get("status") == "complete"
                 and previous.get("input_identity") == item.identity
-                and previous.get("config_hash") == config.config_hash
+                and previous.get("config_hash") == stage_hash
                 and dynamic_path.exists()
                 and static_path.exists()
             )
@@ -89,8 +87,8 @@ def split_files(
             started = time.perf_counter()
             dynamic_path.parent.mkdir(parents=True, exist_ok=True)
             static_path.parent.mkdir(parents=True, exist_ok=True)
-            dynamic_temp = _temporary(dynamic_path)
-            static_temp = _temporary(static_path)
+            dynamic_temp = temporary_file(dynamic_path)
+            static_temp = temporary_file(static_path)
             dynamic_temp.unlink(missing_ok=True)
             static_temp.unlink(missing_ok=True)
 
@@ -153,7 +151,7 @@ def split_files(
                     "date": item.date,
                     "input_identity": item.identity,
                     "input_size_bytes": item.size_bytes,
-                    "config_hash": config.config_hash,
+                    "config_hash": stage_hash,
                     "dynamic_path": str(dynamic_path.resolve()),
                     "static_path": str(static_path.resolve()),
                     "parsed_rows": int(counts[0]),
@@ -176,7 +174,7 @@ def split_files(
                     "status": "failed",
                     "date": item.date,
                     "input_identity": item.identity,
-                    "config_hash": config.config_hash,
+                    "config_hash": stage_hash,
                     "error": f"{type(exc).__name__}: {exc}",
                     "failed_at_utc": datetime.now(timezone.utc).isoformat(),
                 }

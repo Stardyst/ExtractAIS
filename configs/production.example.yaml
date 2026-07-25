@@ -21,3 +21,36 @@ split:
   static_message_types: [5, 24]
   compression: "zstd"
   row_group_size: 1000000
+
+prepare:
+  # 512 buckets keep each 6.24 TB archive bucket manageable on a 128 GB host.
+  # Do not change this after prepare has started.
+  mmsi_buckets: 512
+  compression: "zstd"
+  row_group_size: 1000000
+  max_implied_speed_knots: 80
+
+stops:
+  max_speed_knots: 0.5
+  max_step_km: 0.25
+  max_point_gap_minutes: 60
+  min_duration_minutes: 60
+  max_diameter_km: 1.0
+
+ports:
+  entry_radius_km: 3
+  exit_radius_km: 4
+  approach_radius_km: 10
+  group_distance_km: 4
+  anchor_assignment_radius_km: 20
+  anchor_grid_degrees: 0.005
+  anchor_min_stop_events: 3
+  anchor_min_vessels: 3
+  call_min_points: 2
+  call_max_point_gap_hours: 6
+  ambiguity_margin_km: 1
+  # Set to ["Very Small"] only after reviewing outputs/validation.
+  excluded_harbor_sizes: []
+
+intervals:
+  unknown_gap_hours: 6
