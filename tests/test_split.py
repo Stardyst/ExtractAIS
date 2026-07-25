@@ -2,7 +2,9 @@ import csv
 from pathlib import Path
 
 import duckdb
+import pytest
 
+import extractais.split as split_module
 from extractais.config import load_config
 from extractais.inventory import discover_files
 from extractais.split import split_files
@@ -61,6 +63,13 @@ def test_split_separates_dynamic_static_and_counts_invalid(tmp_path: Path) -> No
     assert record["static_message_rows"] == 1
     assert record["static_valid_rows"] == 1
     assert record["other_rows"] == 1
+    assert record["dynamic_output_bytes"] == Path(record["dynamic_path"]).stat().st_size
+    assert record["static_output_bytes"] == Path(record["static_path"]).stat().st_size
+    assert record["total_output_bytes"] == (
+        record["dynamic_output_bytes"] + record["static_output_bytes"]
+    )
+    assert record["compression_ratio"] > 0
+    assert record["free_space_bytes_after"] > 0
 
     dynamic = duckdb.read_parquet(record["dynamic_path"]).fetchone()
     assert dynamic[0].isoformat(sep=" ") == "2021-01-01 01:02:03"
@@ -74,3 +83,76 @@ def test_split_separates_dynamic_static_and_counts_invalid(tmp_path: Path) -> No
     static = duckdb.read_parquet(record["static_path"]).fetchone()
     assert static[1] == 123456789
     assert static[3] == 9876543
+
+
+def test_split_opens_a_fresh_database_for_each_day(tmp_path: Path, monkeypatch) -> None:
+    raw_root = tmp_path / "raw"
+    year = raw_root / "2021"
+    year.mkdir(parents=True)
+    for day in (1, 2):
+        csv_path = year / f"2021-01-{day:02d}.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(COLUMNS)
+            writer.writerow(
+                _row(
+                    timestamp=f"2021-01-{day:02d} 00:00:00 UTC",
+                    MMSI="123456789",
+                    msg_type="1",
+                    latitude="10",
+                    longitude="20",
+                    speed="5",
+                )
+            )
+
+    config = load_config(_write_config(tmp_path, raw_root, tmp_path / "work"))
+    inventory = discover_files(config)
+    real_open_database = split_module.open_database
+    opened_connections = []
+
+    def tracked_open_database(app_config):
+        connection = real_open_database(app_config)
+        opened_connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(split_module, "open_database", tracked_open_database)
+
+    split_files(config, inventory.files, tmp_path)
+
+    assert len(opened_connections) == 2
+
+
+def test_split_stops_before_reading_when_free_space_guard_is_hit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    raw_root = tmp_path / "raw"
+    year = raw_root / "2021"
+    year.mkdir(parents=True)
+    csv_path = year / "2021-01-01.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(COLUMNS)
+        writer.writerow(
+            _row(
+                timestamp="2021-01-01 00:00:00 UTC",
+                MMSI="123456789",
+                msg_type="1",
+                latitude="10",
+                longitude="20",
+            )
+        )
+
+    config_path = _write_config(tmp_path, raw_root, tmp_path / "work")
+    config_text = config_path.read_text(encoding="utf-8").replace(
+        "progress_bar_time_ms: 1000",
+        "progress_bar_time_ms: 1000\n  minimum_free_space_gb: 1",
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+    config = load_config(config_path)
+    inventory = discover_files(config)
+    monkeypatch.setattr(split_module, "_free_space_bytes", lambda unused: 0)
+
+    with pytest.raises(RuntimeError, match="Free-space guard stopped"):
+        split_files(config, inventory.files, tmp_path)
+
+    assert not (tmp_path / "work" / "stage01_split").exists()

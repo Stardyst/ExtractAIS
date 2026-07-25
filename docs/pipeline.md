@@ -11,13 +11,13 @@ Every work unit follows the same transaction pattern:
 3. Close DuckDB and atomically replace the final output.
 4. Record the Git commit, row counts where practical, elapsed time and completion timestamp.
 
-An interrupted active unit restarts; completed units are skipped.
+An interrupted active unit restarts; completed units are skipped. Stage 01 opens a fresh in-memory DuckDB connection for every source day and closes it before committing outputs, preventing allocator and cache state from accumulating across the two-year run. Before starting an incomplete day, the configured free-space guard checks the work volume.
 
 ## Data stages
 
 ### Stage 01: split
 
-Each CSV is parsed once with all raw columns initially treated as text. Sentinels are normalized, and rows are separated into dynamic message types 1/2/3/18/19/27 and static types 5/24. Dynamic validity requires timestamp, nine-digit MMSI and valid coordinates. Static validity requires timestamp and MMSI.
+Each CSV is parsed once with all raw columns initially treated as text. Sentinels are normalized, and rows are separated into dynamic message types 1/2/3/18/19/27 and static types 5/24. Dynamic validity requires timestamp, nine-digit MMSI and valid coordinates. Static validity requires timestamp and MMSI. The normalized daily table has one summary scan followed by two Parquet `COPY` operations; each `COPY` result supplies its valid-row count. The manifest records output bytes, compression ratio and free space after every completed day.
 
 Source `matchedPortName`, `label`, `sublabel`, `at_dock`, source and collection type remain evidence only. They never directly determine the computed state.
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -76,6 +77,8 @@ def _stage_summary(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def _status(config: AppConfig) -> dict[str, Any]:
+    config.storage.work_root.mkdir(parents=True, exist_ok=True)
+    free_space_gb = shutil.disk_usage(config.storage.work_root).free / 1024**3
     manifest_root = config.storage.work_root / "manifests"
     stages: dict[str, Any] = {}
     split = read_json(manifest_root / "split.json", {"files": {}})
@@ -91,6 +94,8 @@ def _status(config: AppConfig) -> dict[str, Any]:
         stages[name] = _stage_summary(manifest)
     return {
         "work_root": str(config.storage.work_root.resolve()),
+        "free_space_gb": round(free_space_gb, 2),
+        "minimum_free_space_gb": config.runtime.minimum_free_space_gb,
         "stages": stages,
         "trajectory_intervals": str(
             (config.storage.work_root / "outputs" / "trajectory_intervals").resolve()

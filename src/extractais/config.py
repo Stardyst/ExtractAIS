@@ -29,6 +29,7 @@ class RuntimeConfig:
     memory_limit: str
     enable_progress: bool
     progress_bar_time_ms: int
+    minimum_free_space_gb: float
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,9 @@ def load_config(path: Path) -> AppConfig:
             memory_limit=str(runtime_raw["memory_limit"]),
             enable_progress=bool(runtime_raw.get("enable_progress", True)),
             progress_bar_time_ms=int(runtime_raw.get("progress_bar_time_ms", 2000)),
+            minimum_free_space_gb=float(
+                runtime_raw.get("minimum_free_space_gb", 0)
+            ),
         ),
         split=SplitConfig(
             dynamic_message_types=[int(value) for value in split_raw["dynamic_message_types"]],
@@ -200,6 +204,8 @@ def load_config(path: Path) -> AppConfig:
 def _validate_config(config: AppConfig) -> None:
     if config.runtime.threads <= 0:
         raise ValueError("runtime.threads must be positive")
+    if config.runtime.minimum_free_space_gb < 0:
+        raise ValueError("runtime.minimum_free_space_gb cannot be negative")
     if config.prepare.mmsi_buckets <= 0:
         raise ValueError("prepare.mmsi_buckets must be positive")
     if not (

@@ -43,7 +43,7 @@ storage:
   temp_directory: "E:/AIS2021-2022/derived/tmp"
 ```
 
-`configs/production.yaml` 已由 `.gitignore` 排除。路径、线程数和内存限制可以按主机调整；生产主机的 128 GB 内存建议保持 `threads: 20`、`memory_limit: "100GB"`，为系统和文件缓存保留余量。
+`configs/production.yaml` 已由 `.gitignore` 排除。路径、线程数和内存限制可以按主机调整；生产主机的 128 GB 内存建议保持 `threads: 20`、`memory_limit: "100GB"`，为系统和文件缓存保留余量。`minimum_free_space_gb: 500` 表示工作盘不足 500 GiB 时，在读取下一天 CSV 前安全停止。
 
 ## 3. 先检查输入
 
@@ -119,6 +119,7 @@ extractais --config configs/production.yaml run-all
 
 - 已完成的日、月或 MMSI 桶直接跳过。
 - 正在执行但尚未完成的最小工作单元会从头重算。
+- 每个日文件使用独立 DuckDB 连接，完成后立即释放其内存和缓存。
 - 最终文件先写为临时产物，成功后再原子替换；中断不会把半个 Parquet 标记为完成。
 - 检查点位于 `derived/manifests/*.json`，包含输入身份、阶段参数哈希、Git commit、耗时和输出路径。
 - `--force` 会重建该命令所有已完成工作单元，只在确认需要重算时使用。
@@ -223,12 +224,15 @@ extractais --config configs/production.yaml validate
 
 ## 11. 性能和磁盘
 
-- `split` 按原始字节显示总进度，DuckDB 同时显示当前查询进度。
+- `split` 按原始字节显示总进度，DuckDB 同时显示当前查询进度；每个日期完成后显示该日压缩率和工作盘剩余 TiB。
+- `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
 - 后续阶段按月或 MMSI 桶显示进度，单桶可以使用磁盘临时空间完成外部排序。
 - 动态分桶按月只扫描一次，不会为 512 个桶重复扫描全年数据。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。
 - `temp_directory` 必须和 `work_root` 位于容量充足的工作盘；不要指向系统盘。
 - 不要手工删除阶段目录后再执行 `run-all`。当前版本把中间产物视为可复现检查点，删除后会按依赖关系重建。
+
+当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%。据此估计完整 `split` 约 1.03 TiB，完整流程峰值约 3.05 TiB；4.43 TiB 可用空间能够容纳，并保留约 1 TiB 余量。
 
 检查工作盘剩余空间：
 
