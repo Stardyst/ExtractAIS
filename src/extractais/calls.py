@@ -14,6 +14,7 @@ from extractais.fileutils import (
     temporary_directory,
 )
 from extractais.gitmeta import git_commit
+from extractais.isolated import run_isolated
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -25,7 +26,7 @@ from extractais.stage import (
 from extractais.stops import bucket_number, track_bucket_files
 
 
-def _write_candidates(connection, config: AppConfig, track_path: Path, output: Path) -> None:
+def _write_candidates(connection, config: AppConfig, track_path: Path, output: Path) -> int:
     ports_root = config.storage.work_root / "stage05_ports"
     track_source = parquet_sources([track_path])
     tile_source = parquet_sources([ports_root / "anchor_tiles.parquet"])
@@ -74,19 +75,21 @@ def _write_candidates(connection, config: AppConfig, track_path: Path, output: P
         FROM by_group
         ORDER BY mmsi, point_seq, candidate_rank
     """
-    connection.execute(
-        parquet_copy_sql(
-            select_sql,
-            output,
-            config.prepare.compression,
-            config.prepare.row_group_size,
-        )
+    return int(
+        connection.execute(
+            parquet_copy_sql(
+                select_sql,
+                output,
+                config.prepare.compression,
+                config.prepare.row_group_size,
+            )
+        ).fetchone()[0]
     )
 
 
 def _write_port_calls(
     connection, config: AppConfig, candidates_path: Path, output: Path
-) -> None:
+) -> int:
     candidates = parquet_sources([candidates_path])
     stop_matches = parquet_sources(
         [config.storage.work_root / "stage05_ports" / "stop_port_matches.parquet"]
@@ -176,14 +179,45 @@ def _write_port_calls(
           AND matched_stop_count > 0
         ORDER BY mmsi, entry_time_utc
     """
-    connection.execute(
-        parquet_copy_sql(
-            select_sql,
-            output,
-            config.prepare.compression,
-            config.prepare.row_group_size,
-        )
+    return int(
+        connection.execute(
+            parquet_copy_sql(
+                select_sql,
+                output,
+                config.prepare.compression,
+                config.prepare.row_group_size,
+            )
+        ).fetchone()[0]
     )
+
+
+def _write_port_call_bucket(
+    config: AppConfig,
+    track_path: Path,
+    temporary_root: Path,
+) -> Dict[str, int]:
+    temporary_candidates = temporary_root / "candidates.parquet"
+    temporary_calls = temporary_root / "port_calls.parquet"
+    connection = open_database(config)
+    try:
+        candidate_count = _write_candidates(
+            connection,
+            config,
+            track_path,
+            temporary_candidates,
+        )
+        call_count = _write_port_calls(
+            connection,
+            config,
+            temporary_candidates,
+            temporary_calls,
+        )
+        return {
+            "candidate_count": candidate_count,
+            "port_call_count": call_count,
+        }
+    finally:
+        connection.close()
 
 
 def build_port_calls(
@@ -238,32 +272,22 @@ def build_port_calls(
         temporary_root = temporary_directory(bucket_root)
         remove_path(temporary_root, config.storage.work_root)
         temporary_root.mkdir(parents=True, exist_ok=True)
-        temporary_candidates = temporary_root / "candidates.parquet"
-        temporary_calls = temporary_root / "port_calls.parquet"
-        connection = open_database(config)
-        try:
-            _write_candidates(connection, config, track_path, temporary_candidates)
-            _write_port_calls(connection, config, temporary_candidates, temporary_calls)
-            candidate_count = int(
-                connection.execute(
-                    f"SELECT count(*) FROM {parquet_sources([temporary_candidates])}"
-                ).fetchone()[0]
-            )
-            call_count = int(
-                connection.execute(
-                    f"SELECT count(*) FROM {parquet_sources([temporary_calls])}"
-                ).fetchone()[0]
-            )
-        finally:
-            connection.close()
+        worker = run_isolated(
+            _write_port_call_bucket,
+            config,
+            track_path,
+            temporary_root,
+        )
+        counts = worker.value
         replace_directory(temporary_root, bucket_root, config.storage.work_root)
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(bucket_root.resolve()),
-            "candidate_count": candidate_count,
-            "port_call_count": call_count,
+            "candidate_count": counts["candidate_count"],
+            "port_call_count": counts["port_call_count"],
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }

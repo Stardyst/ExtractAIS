@@ -1,4 +1,6 @@
 import csv
+import json
+import os
 from pathlib import Path
 
 import duckdb
@@ -182,6 +184,17 @@ def test_complete_pipeline_builds_port_calls_states_and_validation(tmp_path: Pat
     assert {"IN_PORT", "DEPARTING", "OCEAN", "ARRIVING", "UNKNOWN_GAP"} <= states
     assert (work_root / "outputs" / "validation" / "port_quality.csv").exists()
     assert (work_root / "outputs" / "validation" / "summary.json").exists()
+
+    for stage in ("prepare", "stops", "ports", "calls", "intervals", "validate"):
+        stage_manifest = json.loads(
+            (work_root / "manifests" / f"{stage}.json").read_text(encoding="utf-8")
+        )
+        worker_process_ids = {
+            item["worker_process_id"]
+            for item in stage_manifest["items"].values()
+        }
+        assert worker_process_ids
+        assert os.getpid() not in worker_process_ids
 
     interval_file = next(
         (work_root / "stage07_intervals").glob("mmsi_bucket=*/part.parquet")

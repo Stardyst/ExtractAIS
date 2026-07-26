@@ -10,6 +10,7 @@ from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql
 from extractais.fileutils import replace_file, temporary_file
 from extractais.gitmeta import git_commit
+from extractais.isolated import run_isolated
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -168,13 +169,17 @@ def build_stops(
         ):
             continue
         started = time.perf_counter()
-        stop_count = _write_stop_bucket(config, source_path, output)
+        worker = run_isolated(
+            _write_stop_bucket, config, source_path, output
+        )
+        stop_count = worker.value
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
             "stop_count": stop_count,
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }

@@ -17,6 +17,7 @@ from extractais.fileutils import (
     temporary_file,
 )
 from extractais.gitmeta import git_commit
+from extractais.isolated import run_isolated
 from extractais.manifest import read_json
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
@@ -259,7 +260,8 @@ def prepare_data(
         temporary = temporary_directory(output)
         remove_path(temporary, config.storage.work_root)
         temporary.parent.mkdir(parents=True, exist_ok=True)
-        _copy_partitioned_month(
+        worker = run_isolated(
+            _copy_partitioned_month,
             config,
             [Path(record["dynamic_path"]) for record in month_records],
             temporary,
@@ -270,6 +272,7 @@ def prepare_data(
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }
@@ -285,13 +288,17 @@ def prepare_data(
         manifest, "static", stage_hash, static_signature, [static_output]
     ):
         started = time.perf_counter()
-        vessel_count = _compact_static(config, static_paths, static_output)
+        worker = run_isolated(
+            _compact_static, config, static_paths, static_output
+        )
+        vessel_count = worker.value
         manifest["items"]["static"] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": static_signature,
             "output": str(static_output.resolve()),
             "vessel_count": vessel_count,
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }
@@ -318,13 +325,17 @@ def prepare_data(
         ):
             continue
         started = time.perf_counter()
-        source_rows = _write_track_bucket(config, paths, bucket, output)
+        worker = run_isolated(
+            _write_track_bucket, config, paths, bucket, output
+        )
+        source_rows = worker.value
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
             "source_rows": source_rows,
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }

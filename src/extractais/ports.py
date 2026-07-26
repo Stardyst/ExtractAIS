@@ -17,6 +17,7 @@ from extractais.fileutils import (
     temporary_directory,
 )
 from extractais.gitmeta import git_commit
+from extractais.isolated import run_isolated
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -420,6 +421,31 @@ def _write_port_coverage(connection, output_root: Path, config: AppConfig) -> No
     )
 
 
+def _build_port_catalog_worker(
+    config: AppConfig,
+    stop_paths: list[Path],
+    temporary: Path,
+) -> Dict[str, int]:
+    ports = _read_ports(config)
+    ports, groups = _assign_port_groups(
+        ports,
+        config.ports.group_distance_km,
+        config.runtime.enable_progress,
+    )
+    connection = open_database(config)
+    try:
+        _write_port_tables(connection, temporary, ports, groups, config)
+        _write_anchor_tables(connection, temporary, stop_paths, config)
+        _write_anchor_tiles(connection, temporary, config)
+        _write_port_coverage(connection, temporary, config)
+        return {
+            "port_count": len(ports),
+            "port_group_count": len(groups),
+        }
+    finally:
+        connection.close()
+
+
 def build_ports(
     config: AppConfig, project_root: Path, force: bool = False
 ) -> Dict[str, Any]:
@@ -455,29 +481,25 @@ def build_ports(
         return manifest
 
     started = time.perf_counter()
-    ports = _read_ports(config)
-    ports, groups = _assign_port_groups(
-        ports, config.ports.group_distance_km, config.runtime.enable_progress
-    )
     temporary = temporary_directory(output_root)
     remove_path(temporary, config.storage.work_root)
     temporary.mkdir(parents=True, exist_ok=True)
-    connection = open_database(config)
-    try:
-        _write_port_tables(connection, temporary, ports, groups, config)
-        _write_anchor_tables(connection, temporary, stop_paths, config)
-        _write_anchor_tiles(connection, temporary, config)
-        _write_port_coverage(connection, temporary, config)
-    finally:
-        connection.close()
+    worker = run_isolated(
+        _build_port_catalog_worker,
+        config,
+        stop_paths,
+        temporary,
+    )
+    counts = worker.value
     replace_directory(temporary, output_root, config.storage.work_root)
     manifest["items"]["catalog"] = {
         "status": "complete",
         "config_hash": stage_hash,
         "source_signature": source_signature,
         "output": str(output_root.resolve()),
-        "port_count": len(ports),
-        "port_group_count": len(groups),
+        "port_count": counts["port_count"],
+        "port_group_count": counts["port_group_count"],
+        "worker_process_id": worker.process_id,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "completed_at_utc": utc_now(),
     }

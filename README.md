@@ -16,9 +16,13 @@ extractais --help
 已经创建过 `extractais` 环境时，使用下面的命令更新本地安装：
 
 ```powershell
+git pull origin main
 conda activate extractais
 python -m pip install -e .
+python -c "import extractais; print(extractais.__version__)"
 ```
+
+当前版本应显示 `1.1.0`。
 
 ## 2. 准备生产配置
 
@@ -119,10 +123,26 @@ extractais --config configs/production.yaml run-all
 
 - 已完成的日、月或 MMSI 桶直接跳过。
 - 正在执行但尚未完成的最小工作单元会从头重算。
-- 每个日文件使用独立 DuckDB 连接，完成后立即释放其内存和缓存。
+- 每个重型工作单元在独立操作系统子进程中运行；单元结束后进程退出，DuckDB 原生分配器、缓存、线程和句柄由操作系统整体回收。
 - 最终文件先写为临时产物，成功后再原子替换；中断不会把半个 Parquet 标记为完成。
-- 检查点位于 `derived/manifests/*.json`，包含输入身份、阶段参数哈希、Git commit、耗时和输出路径。
+- 检查点位于 `derived/manifests/*.json`，包含输入身份、阶段参数哈希、Git commit、子进程 PID、耗时和输出路径。
 - `--force` 会重建该命令所有已完成工作单元，只在确认需要重算时使用。
+
+子进程隔离边界与恢复粒度一致：`split` 为每日文件，`prepare` 为月/静态表/MMSI 桶，`stops`、`calls` 和区间构建为 MMSI 桶，`ports`、年度导出和 `validate` 各为一个整体单元。任意时刻只运行一个重型子进程，不会因为隔离而并发占用多份 `memory_limit`。
+
+### 从 1.0.1 升级并继续现有 split
+
+先停止旧进程，再在仓库根目录执行：
+
+```powershell
+git pull origin main
+conda activate extractais
+python -m pip install -e .
+python -c "import extractais; print(extractais.__version__)"
+extractais --config configs/production.yaml split
+```
+
+不需要删除 `derived`，也不要加 `--force`。原 manifest 中已经完成的日期会直接跳过；中断时正在处理且尚未提交的日期会重算。旧记录没有 `worker_process_id` 属于正常情况，新完成记录会写入该字段。
 
 查看目前进度和最终路径：
 
@@ -226,6 +246,8 @@ extractais --config configs/production.yaml validate
 
 - `split` 按原始字节显示总进度，DuckDB 同时显示当前查询进度；每个日期完成后显示该日压缩率和工作盘剩余 TiB。
 - `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
+- 恢复时总进度从已完成文件的真实字节数开始，跳过旧日期不会再产生虚假的 TB/s 瞬时速度。
+- 每个重型工作单元由独立子进程执行，修复了长时间运行中 DuckDB 连接虽然关闭、但同一 Python 进程的原生分配器和缓存仍持续累积而导致的吞吐衰减。
 - 后续阶段按月或 MMSI 桶显示进度，单桶可以使用磁盘临时空间完成外部排序。
 - 动态分桶按月只扫描一次，不会为 512 个桶重复扫描全年数据。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。

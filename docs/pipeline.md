@@ -4,14 +4,15 @@
 
 The production archive contains daily CSV files under `2021/` and `2022/`, approximately 6.24 TB in total. DuckDB performs every row-level transformation and may spill to the configured work disk. Python only inventories files, divides work into bounded units and commits checkpoints.
 
-Every work unit follows the same transaction pattern:
+Every heavy work unit runs in a fresh spawned operating-system process and follows the same transaction pattern:
 
 1. Compare the input identity, stage-specific configuration hash and required output files with the manifest.
 2. Write to a sibling `.tmp` file or directory.
-3. Close DuckDB and atomically replace the final output.
-4. Record the Git commit, row counts where practical, elapsed time and completion timestamp.
+3. Close DuckDB, return only compact statistics, and exit the worker process.
+4. Atomically replace the final output.
+5. Record the Git commit, worker PID, row counts where practical, elapsed time and completion timestamp.
 
-An interrupted active unit restarts; completed units are skipped. Stage 01 opens a fresh in-memory DuckDB connection for every source day and closes it before committing outputs, preventing allocator and cache state from accumulating across the two-year run. Before starting an incomplete day, the configured free-space guard checks the work volume.
+An interrupted active unit restarts; completed units are skipped. Process exit is the resource boundary: it releases DuckDB native allocator state, caches, threads and handles that closing a connection alone may retain in a long-lived Python process. Only one heavy worker runs at a time. Stage 01 uses one worker per source day; later boundaries are one month, static compaction, one MMSI bucket, the port catalog, annual export, or the validation report as appropriate. Before starting an incomplete day, the configured free-space guard checks the work volume.
 
 ## Data stages
 

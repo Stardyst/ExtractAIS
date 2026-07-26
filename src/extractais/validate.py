@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -8,6 +9,7 @@ from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql, sql_literal
 from extractais.fileutils import remove_path, replace_directory, temporary_directory
 from extractais.gitmeta import git_commit
+from extractais.isolated import run_isolated
 from extractais.manifest import write_json_atomic
 from extractais.sql import parquet_sources
 from extractais.stage import (
@@ -26,7 +28,7 @@ def _csv_copy(connection, select_sql: str, output: Path) -> None:
     """)
 
 
-def build_validation(
+def _build_validation_in_process(
     config: AppConfig, project_root: Path, force: bool = False
 ) -> Dict[str, Any]:
     calls = sorted(
@@ -237,8 +239,20 @@ def build_validation(
         "config_hash": stage_hash,
         "source_signature": source_signature,
         "output": str(output_root.resolve()),
+        "worker_process_id": os.getpid(),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "completed_at_utc": utc_now(),
     }
     save_stage_manifest(manifest_path, manifest)
     return manifest
+
+
+def build_validation(
+    config: AppConfig, project_root: Path, force: bool = False
+) -> Dict[str, Any]:
+    return run_isolated(
+        _build_validation_in_process,
+        config,
+        project_root,
+        force,
+    ).value

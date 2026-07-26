@@ -16,6 +16,7 @@ from extractais.fileutils import (
     temporary_file,
 )
 from extractais.gitmeta import git_commit
+from extractais.isolated import run_isolated
 from extractais.sql import parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -43,7 +44,7 @@ def _write_interval_bucket(
     candidates_path: Path,
     calls_path: Path,
     output: Path,
-) -> None:
+) -> int:
     tracks = parquet_sources([track_path])
     candidates = parquet_sources([candidates_path])
     calls = parquet_sources([calls_path])
@@ -269,40 +270,66 @@ def _write_interval_bucket(
         WHERE end_time_utc >= start_time_utc
         ORDER BY mmsi, start_time_utc, state
     """
-    connection.execute(
-        parquet_copy_sql(
-            select_sql,
-            output,
-            config.prepare.compression,
-            config.prepare.row_group_size,
-        )
+    return int(
+        connection.execute(
+            parquet_copy_sql(
+                select_sql,
+                output,
+                config.prepare.compression,
+                config.prepare.row_group_size,
+            )
+        ).fetchone()[0]
     )
 
 
-def _export_yearly(config: AppConfig, sources: list[Path], output_root: Path) -> None:
+def _write_interval_bucket_worker(
+    config: AppConfig,
+    track_path: Path,
+    candidates_path: Path,
+    calls_path: Path,
+    output: Path,
+) -> int:
+    connection = open_database(config)
+    try:
+        return _write_interval_bucket(
+            connection,
+            config,
+            track_path,
+            candidates_path,
+            calls_path,
+            output,
+        )
+    finally:
+        connection.close()
+
+
+def _export_yearly(config: AppConfig, sources: list[Path], output_root: Path) -> int:
     temporary = temporary_directory(output_root)
     remove_path(temporary, config.storage.work_root)
     temporary.parent.mkdir(parents=True, exist_ok=True)
     source = parquet_sources(sources)
     connection = open_database(config)
     try:
-        connection.execute(f"""
-            COPY (
-                SELECT * EXCLUDE (mmsi_bucket), mmsi_bucket
-                FROM {source}
-                ORDER BY year, mmsi, start_time_utc
-            )
-            TO {sql_literal(str(temporary.resolve()))}
-            (
-                FORMAT PARQUET,
-                PARTITION_BY (year),
-                COMPRESSION {config.prepare.compression.upper()},
-                ROW_GROUP_SIZE {config.prepare.row_group_size}
-            )
-        """)
+        exported_count = int(
+            connection.execute(f"""
+                COPY (
+                    SELECT * EXCLUDE (mmsi_bucket), mmsi_bucket
+                    FROM {source}
+                    ORDER BY year, mmsi, start_time_utc
+                )
+                TO {sql_literal(str(temporary.resolve()))}
+                (
+                    FORMAT PARQUET,
+                    PARTITION_BY (year),
+                    COMPRESSION {config.prepare.compression.upper()},
+                    ROW_GROUP_SIZE {config.prepare.row_group_size}
+                )
+            """).fetchone()[0]
+        )
     finally:
         connection.close()
     replace_directory(temporary, output_root, config.storage.work_root)
+    return exported_count
 
 
 def build_intervals(
@@ -348,24 +375,22 @@ def build_intervals(
         temporary = temporary_file(output)
         temporary.unlink(missing_ok=True)
         output.parent.mkdir(parents=True, exist_ok=True)
-        connection = open_database(config)
-        try:
-            _write_interval_bucket(
-                connection,
-                config,
-                track_path,
-                candidates_path,
-                calls_path,
-                temporary,
-            )
-        finally:
-            connection.close()
+        worker = run_isolated(
+            _write_interval_bucket_worker,
+            config,
+            track_path,
+            candidates_path,
+            calls_path,
+            temporary,
+        )
         replace_file(temporary, output)
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
+            "interval_count": worker.value,
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }
@@ -380,12 +405,14 @@ def build_intervals(
         manifest, "yearly_export", stage_hash, export_signature, [output_root]
     ):
         started = time.perf_counter()
-        _export_yearly(config, outputs, output_root)
+        worker = run_isolated(_export_yearly, config, outputs, output_root)
         manifest["items"]["yearly_export"] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": export_signature,
             "output": str(output_root.resolve()),
+            "interval_count": worker.value,
+            "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }

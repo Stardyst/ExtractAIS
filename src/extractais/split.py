@@ -14,6 +14,7 @@ from extractais.database import open_database, parquet_copy_sql, sql_literal
 from extractais.fileutils import temporary_file
 from extractais.gitmeta import git_commit
 from extractais.inventory import InputFile
+from extractais.isolated import run_isolated
 from extractais.manifest import load_split_manifest, write_json_atomic
 from extractais.schema import (
     DYNAMIC_SELECT,
@@ -153,9 +154,26 @@ def split_files(
     manifest["minimum_free_space_gb"] = config.runtime.minimum_free_space_gb
     manifest["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
 
+    completion: Dict[str, bool] = {}
+    for item in selected:
+        dynamic_path, static_path = _output_paths(config.storage.work_root, item)
+        previous = manifest["files"].get(item.path)
+        completion[item.path] = bool(
+            previous
+            and previous.get("status") == "complete"
+            and previous.get("input_identity") == item.identity
+            and previous.get("config_hash") == stage_hash
+            and dynamic_path.exists()
+            and static_path.exists()
+            and not force
+        )
     total_bytes = sum(item.size_bytes for item in selected)
+    completed_bytes = sum(
+        item.size_bytes for item in selected if completion[item.path]
+    )
     progress = tqdm(
         total=total_bytes,
+        initial=completed_bytes,
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
@@ -167,17 +185,7 @@ def split_files(
     try:
         for item in selected:
             dynamic_path, static_path = _output_paths(config.storage.work_root, item)
-            previous = manifest["files"].get(item.path)
-            complete = (
-                previous
-                and previous.get("status") == "complete"
-                and previous.get("input_identity") == item.identity
-                and previous.get("config_hash") == stage_hash
-                and dynamic_path.exists()
-                and static_path.exists()
-            )
-            if complete and not force:
-                progress.update(item.size_bytes)
+            if completion[item.path]:
                 progress.set_postfix_str(f"skip {item.date}")
                 continue
 
@@ -194,9 +202,11 @@ def split_files(
             static_temp.unlink(missing_ok=True)
 
             try:
-                statistics = _process_day(
+                worker = run_isolated(
+                    _process_day,
                     config, item, dynamic_temp, static_temp
                 )
+                statistics = worker.value
                 os.replace(dynamic_temp, dynamic_path)
                 os.replace(static_temp, static_path)
 
@@ -222,6 +232,7 @@ def split_files(
                     "total_output_bytes": total_output_bytes,
                     "compression_ratio": round(compression_ratio, 6),
                     "free_space_bytes_after": free_after,
+                    "worker_process_id": worker.process_id,
                     "elapsed_seconds": round(elapsed, 3),
                     "completed_at_utc": datetime.now(timezone.utc).isoformat(),
                 }

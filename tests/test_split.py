@@ -1,4 +1,5 @@
 import csv
+import os
 from pathlib import Path
 
 import duckdb
@@ -85,7 +86,7 @@ def test_split_separates_dynamic_static_and_counts_invalid(tmp_path: Path) -> No
     assert static[3] == 9876543
 
 
-def test_split_opens_a_fresh_database_for_each_day(tmp_path: Path, monkeypatch) -> None:
+def test_split_runs_each_day_in_a_distinct_worker_process(tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
     year = raw_root / "2021"
     year.mkdir(parents=True)
@@ -107,19 +108,13 @@ def test_split_opens_a_fresh_database_for_each_day(tmp_path: Path, monkeypatch) 
 
     config = load_config(_write_config(tmp_path, raw_root, tmp_path / "work"))
     inventory = discover_files(config)
-    real_open_database = split_module.open_database
-    opened_connections = []
+    manifest = split_files(config, inventory.files, tmp_path)
+    worker_process_ids = {
+        record["worker_process_id"] for record in manifest["files"].values()
+    }
 
-    def tracked_open_database(app_config):
-        connection = real_open_database(app_config)
-        opened_connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(split_module, "open_database", tracked_open_database)
-
-    split_files(config, inventory.files, tmp_path)
-
-    assert len(opened_connections) == 2
+    assert len(worker_process_ids) == 2
+    assert os.getpid() not in worker_process_ids
 
 
 def test_split_stops_before_reading_when_free_space_guard_is_hit(
