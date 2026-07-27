@@ -22,7 +22,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-当前版本应显示 `1.2.0`。
+当前版本应显示 `1.3.0`。
 
 ## 2. 准备生产配置
 
@@ -150,7 +150,21 @@ extractais --config configs/production.yaml split
 extractais --config configs/production.yaml prepare
 ```
 
-版本应为 `1.2.0`。已经提交的月份会跳过，中断时正在处理的月份会重算。新完成月份会在 `manifests/prepare.json` 中记录输入/输出字节、行数、实际 MiB/s、执行前后剩余空间和子进程 PID。
+版本应为 `1.3.0`。在继续 `prepare` 前，将实际使用的 `configs/production.yaml` 更新为：
+
+```yaml
+runtime:
+  minimum_free_space_gb: 500
+
+prepare:
+  mmsi_buckets: 256
+  partition_write_max_open_files: 100
+  compression: "zstd"
+  row_group_size: 250000
+  max_implied_speed_knots: 80
+```
+
+`mmsi_buckets` 从 512 改为 256 后，旧版已经提交的月份会因 prepare 配置哈希变化而重新生成；中断时未提交的 `.tmp` 月份也会重算。不需要手工删除 `derived`，更不能混用 512 桶和 256 桶的月度目录。新完成月份会在 `manifests/prepare.json` 中记录输入/输出字节、行数、实际 MiB/s、执行前后剩余空间和子进程 PID。
 
 查看目前进度和最终路径：
 
@@ -256,13 +270,15 @@ extractais --config configs/production.yaml validate
 - `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
 - 恢复时总进度从已完成文件的真实字节数开始，跳过旧日期不会再产生虚假的 TB/s 瞬时速度。
 - 每个重型工作单元由独立子进程执行，修复了长时间运行中 DuckDB 连接虽然关闭、但同一 Python 进程的原生分配器和缓存仍持续累积而导致的吞吐衰减。
-- `prepare` 将 DuckDB 的分区文件上限设置为 `mmsi_buckets`。生产配置的 512 个桶可以同时保持打开，避免默认 100 个文件上限造成反复刷新；静态压缩和轨迹排序也不再为了计数额外扫描输入。
+- `prepare` 使用 256 个 MMSI 桶，使当前实测月度输入平均每桶约 119 MiB；同时打开的分区文件独立限制为 100，避免 HDD 同时维护全部 Parquet 写入流和大 row-group 缓冲。
+- 生产 `row_group_size` 为 250000，降低分区写入峰值内存，并为后续单桶并行扫描保留足够的 row group。
+- 在同一份 1000 万行合成输入上，旧参数 `512/512/1000000` 的月分区写入耗时约 9.93 秒，新参数 `256/100/250000` 约 7.36 秒；新配置生成 536 个文件，而测试过的 64 文件上限会生成 831 个文件，因此未采用 64。
 - `prepare` 的月/桶进度显示该工作单元的实际压缩读写 MiB/s 和剩余 TiB；这比外层 `it/s` 更适合判断吞吐是否稳定。
 - 后续阶段按月或 MMSI 桶显示进度，单桶可以使用磁盘临时空间完成外部排序。
-- 动态分桶按月只扫描一次，不会为 512 个桶重复扫描全年数据。
+- 动态分桶按月只扫描一次，不会为 256 个桶重复扫描全年数据。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。
 - `temp_directory` 必须和 `work_root` 位于容量充足的工作盘；不要指向系统盘。
-- 空间保护要求 `free >= minimum_free_space + estimated_output`。如果不满足，命令会在创建下一个临时输出前报 `Storage guard stopped`；当前已完成检查点不会受损。
+- 空间保护要求 `free >= minimum_free_space + estimated_output`。未配置时 `minimum_free_space_gb` 默认 500；如果不满足，命令会在创建下一个临时输出前报 `Storage guard stopped`，当前已完成检查点不会受损。
 - 不要手工删除阶段目录后再执行 `run-all`。当前版本把中间产物视为可复现检查点，删除后会按依赖关系重建。
 
 当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%。据此估计完整 `split` 约 1.03 TiB，完整流程峰值约 3.05 TiB；4.43 TiB 可用空间能够容纳，并保留约 1 TiB 余量。

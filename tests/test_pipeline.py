@@ -1,6 +1,8 @@
 import csv
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import duckdb
@@ -37,6 +39,7 @@ runtime:
   memory_limit: "1GB"
   enable_progress: false
   progress_bar_time_ms: 1000
+  minimum_free_space_gb: 0
 split:
   dynamic_message_types: [1, 2, 3, 18, 19, 27]
   static_message_types: [5, 24]
@@ -44,6 +47,7 @@ split:
   row_group_size: 10000
 prepare:
   mmsi_buckets: 2
+  partition_write_max_open_files: 1
   compression: "zstd"
   row_group_size: 10000
   max_implied_speed_knots: 1000
@@ -260,8 +264,8 @@ def test_prepare_stops_before_work_when_storage_budget_is_insufficient(
 
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
-            "progress_bar_time_ms: 1000",
-            "progress_bar_time_ms: 1000\n  minimum_free_space_gb: 1000000",
+            "minimum_free_space_gb: 0",
+            "minimum_free_space_gb: 1000000",
         ),
         encoding="utf-8",
     )
@@ -273,7 +277,35 @@ def test_prepare_stops_before_work_when_storage_budget_is_insufficient(
     assert not (work_root / "stage02_partitioned").exists()
 
 
-def test_duckdb_partition_writer_can_keep_every_mmsi_bucket_open(
+def test_missing_space_reserve_defaults_to_500_gib(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    config_path = _pipeline_config(tmp_path, raw_root, tmp_path / "work")
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  minimum_free_space_gb: 0\n", ""
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+
+    assert config.runtime.minimum_free_space_gb == 500
+
+
+def test_production_example_uses_bounded_partition_writers() -> None:
+    project_root = Path(__file__).parents[1]
+    config = load_config(project_root / "configs" / "production.example.yaml")
+
+    assert config.prepare.mmsi_buckets == 256
+    assert config.prepare.partition_write_max_open_files == 100
+    assert config.prepare.row_group_size == 250_000
+    assert config.runtime.minimum_free_space_gb == 500
+
+
+def test_duckdb_partition_writer_limits_open_files_independently_of_buckets(
     tmp_path: Path,
 ) -> None:
     raw_root = tmp_path / "raw"
@@ -291,4 +323,45 @@ def test_duckdb_partition_writer_can_keep_every_mmsi_bucket_open(
     finally:
         connection.close()
 
-    assert maximum_open_files == config.prepare.mmsi_buckets
+    assert maximum_open_files == config.prepare.partition_write_max_open_files
+    assert maximum_open_files < config.prepare.mmsi_buckets
+
+
+def test_diagnostic_classifies_partition_writer_fanout() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is required for the diagnostic script test")
+
+    helper = Path(__file__).parents[1] / "scripts" / "prepare_diagnostic_findings.ps1"
+    command = f"""
+. '{helper.as_posix()}'
+$summary = [pscustomobject]@{{
+    AverageCpuPercent = 3.77
+    AverageCpuCores = 1.21
+    PeakPrivateGiB = 63.56
+    MinimumAvailableMemoryGiB = 40.30
+    PeakHandles = 1036
+    AverageProcessReadMiBps = 48.71
+    AverageProcessWriteMiBps = 64.59
+    AverageDiskReadMiBps = 0
+    AverageDiskWriteMiBps = 41.09
+    AverageDiskBusyPercent = 64.78
+    AverageDiskQueue = 0.53
+    PeakDiskQueue = 18
+    OutputGrowthGiB = 0
+    OutputFilesAtEnd = 512
+    TempGrowthGiB = 0.07
+    FreeSpaceChangeGiB = -8.29
+}}
+$findings = @(Get-PrepareDiagnosticFindings -Summary $summary -Phase 'partition_month' -MmsiBuckets 512)
+ConvertTo-Json -InputObject $findings -Compress
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    findings = json.loads(result.stdout)
+    assert any("partition writer fan-out" in finding.lower() for finding in findings)

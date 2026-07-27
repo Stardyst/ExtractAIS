@@ -140,8 +140,8 @@ def test_split_stops_before_reading_when_free_space_guard_is_hit(
 
     config_path = _write_config(tmp_path, raw_root, tmp_path / "work")
     config_text = config_path.read_text(encoding="utf-8").replace(
-        "progress_bar_time_ms: 1000",
-        "progress_bar_time_ms: 1000\n  minimum_free_space_gb: 1",
+        "minimum_free_space_gb: 0",
+        "minimum_free_space_gb: 1",
     )
     config_path.write_text(config_text, encoding="utf-8")
     config = load_config(config_path)

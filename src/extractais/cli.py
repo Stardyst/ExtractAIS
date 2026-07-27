@@ -96,6 +96,13 @@ def _status(config: AppConfig) -> dict[str, Any]:
         "work_root": str(config.storage.work_root.resolve()),
         "free_space_gb": round(free_space_gb, 2),
         "minimum_free_space_gb": config.runtime.minimum_free_space_gb,
+        "prepare_settings": {
+            "mmsi_buckets": config.prepare.mmsi_buckets,
+            "partition_write_max_open_files": (
+                config.prepare.partition_write_max_open_files
+            ),
+            "row_group_size": config.prepare.row_group_size,
+        },
         "stages": stages,
         "trajectory_intervals": str(
             (config.storage.work_root / "outputs" / "trajectory_intervals").resolve()

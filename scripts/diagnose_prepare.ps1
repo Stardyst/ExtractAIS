@@ -11,6 +11,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "prepare_diagnostic_findings.ps1")
 
 if ($DurationMinutes -le 0) {
     throw "DurationMinutes must be greater than zero."
@@ -33,6 +34,7 @@ print(json.dumps({
     "work_root": str(config.storage.work_root),
     "temp_directory": str(config.storage.temp_directory),
     "mmsi_buckets": config.prepare.mmsi_buckets,
+    "partition_write_max_open_files": config.prepare.partition_write_max_open_files,
     "threads": config.runtime.threads,
     "memory_limit": config.runtime.memory_limit,
     "minimum_free_space_gb": config.runtime.minimum_free_space_gb,
@@ -252,6 +254,7 @@ Write-Host "ExtractAIS / DuckDB: $($configInfo.extractais_version) / $($configIn
 Write-Host "Threads            : $($configInfo.threads)"
 Write-Host "Memory limit       : $($configInfo.memory_limit)"
 Write-Host "MMSI buckets       : $($configInfo.mmsi_buckets)"
+Write-Host "Open partition files: $($configInfo.partition_write_max_open_files)"
 Write-Host "Reserve            : $($configInfo.minimum_free_space_gb) GiB"
 Write-Host "Initial process IDs: $($initialProcessIds -join ', ')"
 Write-Host ""
@@ -354,33 +357,10 @@ Write-Host ""
 Write-Host "Summary"
 $summary | Format-List
 
-$findings = [System.Collections.Generic.List[string]]::new()
-if ($summary.AverageCpuPercent -ge 70) {
-    $findings.Add("CPU-bound: compression or query execution keeps most logical CPUs busy.")
-}
-if ($summary.AverageDiskBusyPercent -ge 80 -and $summary.AverageDiskQueue -ge 2) {
-    if (($summary.AverageDiskReadMiBps + $summary.AverageDiskWriteMiBps) -lt 30) {
-        $findings.Add("Storage-bound with low throughput: the disk is busy but transfers little data, consistent with random I/O or fragmented partition writes.")
-    } else {
-        $findings.Add("Storage-bound: the work disk is saturated and has a sustained queue.")
-    }
-}
-if ($summary.TempGrowthGiB -gt 1) {
-    $findings.Add("DuckDB spill detected: temporary files grew by more than 1 GiB during the sample.")
-}
-if ($summary.MinimumAvailableMemoryGiB -lt 10) {
-    $findings.Add("Memory pressure detected: system available memory fell below 10 GiB.")
-}
-if ($phase -eq "partition_month" -and $summary.OutputFilesAtEnd -gt ([int]$configInfo.mmsi_buckets * 2)) {
-    $findings.Add("Partition file multiplication detected: output file count exceeds twice the configured bucket count.")
-}
-if ($summary.AverageCpuPercent -lt 30 -and $summary.AverageDiskBusyPercent -lt 60 -and
-    ($summary.AverageProcessReadMiBps + $summary.AverageProcessWriteMiBps) -lt 30) {
-    $findings.Add("Low resource utilization: inspect antivirus/indexing, file-system metadata overhead, or a query phase with limited parallelism.")
-}
-if ($findings.Count -eq 0) {
-    $findings.Add("No single dominant bottleneck was identified; use the numeric summary for comparison across a longer sample.")
-}
+$findings = @(Get-PrepareDiagnosticFindings `
+    -Summary $summary `
+    -Phase $phase `
+    -MmsiBuckets ([int]$configInfo.mmsi_buckets))
 
 Write-Host "Findings"
 foreach ($finding in $findings) {

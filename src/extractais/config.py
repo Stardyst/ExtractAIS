@@ -42,9 +42,10 @@ class SplitConfig:
 
 @dataclass(frozen=True)
 class PrepareConfig:
-    mmsi_buckets: int = 512
+    mmsi_buckets: int = 256
+    partition_write_max_open_files: int = 100
     compression: str = "zstd"
-    row_group_size: int = 1_000_000
+    row_group_size: int = 250_000
     max_implied_speed_knots: float = 80.0
 
 
@@ -147,7 +148,7 @@ def load_config(path: Path) -> AppConfig:
             enable_progress=bool(runtime_raw.get("enable_progress", True)),
             progress_bar_time_ms=int(runtime_raw.get("progress_bar_time_ms", 2000)),
             minimum_free_space_gb=float(
-                runtime_raw.get("minimum_free_space_gb", 0)
+                runtime_raw.get("minimum_free_space_gb", 500)
             ),
         ),
         split=SplitConfig(
@@ -157,9 +158,12 @@ def load_config(path: Path) -> AppConfig:
             row_group_size=int(split_raw.get("row_group_size", 1_000_000)),
         ),
         prepare=PrepareConfig(
-            mmsi_buckets=int(prepare_raw.get("mmsi_buckets", 512)),
+            mmsi_buckets=int(prepare_raw.get("mmsi_buckets", 256)),
+            partition_write_max_open_files=int(
+                prepare_raw.get("partition_write_max_open_files", 100)
+            ),
             compression=str(prepare_raw.get("compression", "zstd")).lower(),
-            row_group_size=int(prepare_raw.get("row_group_size", 1_000_000)),
+            row_group_size=int(prepare_raw.get("row_group_size", 250_000)),
             max_implied_speed_knots=float(
                 prepare_raw.get("max_implied_speed_knots", 80.0)
             ),
@@ -208,6 +212,18 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("runtime.minimum_free_space_gb cannot be negative")
     if config.prepare.mmsi_buckets <= 0:
         raise ValueError("prepare.mmsi_buckets must be positive")
+    if config.prepare.partition_write_max_open_files <= 0:
+        raise ValueError(
+            "prepare.partition_write_max_open_files must be positive"
+        )
+    if (
+        config.prepare.partition_write_max_open_files
+        > config.prepare.mmsi_buckets
+    ):
+        raise ValueError(
+            "prepare.partition_write_max_open_files cannot exceed "
+            "prepare.mmsi_buckets"
+        )
     if not (
         0 < config.ports.entry_radius_km
         <= config.ports.exit_radius_km

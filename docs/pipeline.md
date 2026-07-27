@@ -28,7 +28,7 @@ Source `matchedPortName`, `label`, `sublabel`, `at_dock`, source and collection 
 
 Static messages are reduced to one row per MMSI using the latest non-null value of each field, with first/last timestamps and message count retained.
 
-Dynamic Parquet is scanned once per month and physically partitioned by `mmsi % bucket_count`. DuckDB may keep all configured bucket files open instead of rotating through its lower default limit. Each resulting bucket is then read across all months, exactly deduplicated, sorted by MMSI/time and assigned a per-vessel point sequence. Same-time coordinate conflicts and implied speeds above the configured limit are flagged. Partition and track manifests retain compressed input/output bytes, output rows, effective MiB/s and storage-budget observations.
+Dynamic Parquet is scanned once per month and physically partitioned by `mmsi % bucket_count`. The number of concurrently open partition files is capped independently from the bucket count, preventing hundreds of Parquet writers and row-group buffers from remaining active together on the HDD. Each resulting bucket is then read across all months, exactly deduplicated, sorted by MMSI/time and assigned a per-vessel point sequence. Same-time coordinate conflicts and implied speeds above the configured limit are flagged. Partition and track manifests retain compressed input/output bytes, output rows, effective MiB/s and storage-budget observations.
 
 ### Stage 04: stop events
 

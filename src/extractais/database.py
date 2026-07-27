@@ -29,7 +29,7 @@ def open_database(
     )
     connection.execute(
         "SET partitioned_write_max_open_files = "
-        f"{config.prepare.mmsi_buckets}"
+        f"{config.prepare.partition_write_max_open_files}"
     )
     connection.execute("SET preserve_insertion_order = false")
     if config.runtime.enable_progress:

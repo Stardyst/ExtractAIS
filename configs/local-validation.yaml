@@ -25,6 +25,7 @@ split:
 
 prepare:
   mmsi_buckets: 8
+  partition_write_max_open_files: 4
   compression: "zstd"
   row_group_size: 10000
   max_implied_speed_knots: 80

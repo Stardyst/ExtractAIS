@@ -26,11 +26,15 @@ split:
   row_group_size: 1000000
 
 prepare:
-  # 512 buckets keep each 6.24 TB archive bucket manageable on a 128 GB host.
+  # 256 buckets keep monthly partitions above roughly 100 MiB while leaving
+  # each full-archive bucket manageable on a 128 GiB host.
   # Do not change this after prepare has started.
-  mmsi_buckets: 512
+  mmsi_buckets: 256
+  # Limit concurrent partition writers on the HDD; this is intentionally
+  # independent from mmsi_buckets.
+  partition_write_max_open_files: 100
   compression: "zstd"
-  row_group_size: 1000000
+  row_group_size: 250000
   max_implied_speed_knots: 80
 
 stops:
