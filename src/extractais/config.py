@@ -27,8 +27,11 @@ class StorageConfig:
 class RuntimeConfig:
     threads: int
     memory_limit: str
+    bucket_workers: int
+    bucket_threads: int
+    bucket_memory_limit: str
+    bucket_temp_limit_gb: float
     enable_progress: bool
-    progress_bar_time_ms: int
     minimum_free_space_gb: float
 
 
@@ -143,10 +146,17 @@ def load_config(path: Path) -> AppConfig:
             temp_directory=_resolve_path(storage_raw["temp_directory"], base),
         ),
         runtime=RuntimeConfig(
-            threads=int(runtime_raw["threads"]),
-            memory_limit=str(runtime_raw["memory_limit"]),
+            threads=int(runtime_raw.get("threads", 20)),
+            memory_limit=str(runtime_raw.get("memory_limit", "90GB")),
+            bucket_workers=int(runtime_raw.get("bucket_workers", 2)),
+            bucket_threads=int(runtime_raw.get("bucket_threads", 10)),
+            bucket_memory_limit=str(
+                runtime_raw.get("bucket_memory_limit", "42GB")
+            ),
+            bucket_temp_limit_gb=float(
+                runtime_raw.get("bucket_temp_limit_gb", 256)
+            ),
             enable_progress=bool(runtime_raw.get("enable_progress", True)),
-            progress_bar_time_ms=int(runtime_raw.get("progress_bar_time_ms", 2000)),
             minimum_free_space_gb=float(
                 runtime_raw.get("minimum_free_space_gb", 500)
             ),
@@ -208,6 +218,12 @@ def load_config(path: Path) -> AppConfig:
 def _validate_config(config: AppConfig) -> None:
     if config.runtime.threads <= 0:
         raise ValueError("runtime.threads must be positive")
+    if config.runtime.bucket_workers <= 0:
+        raise ValueError("runtime.bucket_workers must be positive")
+    if config.runtime.bucket_threads <= 0:
+        raise ValueError("runtime.bucket_threads must be positive")
+    if config.runtime.bucket_temp_limit_gb <= 0:
+        raise ValueError("runtime.bucket_temp_limit_gb must be positive")
     if config.runtime.minimum_free_space_gb < 0:
         raise ValueError("runtime.minimum_free_space_gb cannot be negative")
     if config.prepare.mmsi_buckets <= 0:

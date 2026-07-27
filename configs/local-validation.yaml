@@ -13,8 +13,11 @@ storage:
 runtime:
   threads: 4
   memory_limit: "4GB"
+  bucket_workers: 2
+  bucket_threads: 2
+  bucket_memory_limit: "1536MB"
+  bucket_temp_limit_gb: 1
   enable_progress: true
-  progress_bar_time_ms: 500
   minimum_free_space_gb: 1
 
 split:

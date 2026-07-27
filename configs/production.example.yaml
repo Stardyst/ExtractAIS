@@ -12,9 +12,12 @@ storage:
 
 runtime:
   threads: 20
-  memory_limit: "100GB"
+  memory_limit: "90GB"
+  bucket_workers: 2
+  bucket_threads: 10
+  bucket_memory_limit: "42GB"
+  bucket_temp_limit_gb: 256
   enable_progress: true
-  progress_bar_time_ms: 2000
   # Preserve this much free space after the next estimated work-unit output.
   # The guard applies to every stage and also caps DuckDB temporary spill files.
   minimum_free_space_gb: 500

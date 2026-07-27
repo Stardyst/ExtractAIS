@@ -17,7 +17,7 @@ from extractais.fileutils import (
     temporary_file,
 )
 from extractais.gitmeta import git_commit
-from extractais.isolated import run_isolated
+from extractais.isolated import IsolatedCall, run_isolated, run_isolated_many
 from extractais.manifest import read_json
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
@@ -31,9 +31,11 @@ from extractais.storage import (
     TIB,
     directory_size,
     ensure_storage_budget,
+    ensure_parallel_storage_budget,
     free_space_bytes,
     total_file_size,
 )
+from extractais.progress import HONEST_BAR_FORMAT, ProgressEstimator, format_duration
 
 
 def _split_records(config: AppConfig) -> list[Dict[str, Any]]:
@@ -207,7 +209,7 @@ def _write_track_bucket(
             FROM measured
         )
         SELECT
-            *,
+            * EXCLUDE (prev_timestamp_utc, prev_latitude, prev_longitude),
             coalesce(implied_speed_knots > {config.prepare.max_implied_speed_knots}, false)
                 AS is_kinematic_outlier,
             {bucket}::INTEGER AS mmsi_bucket
@@ -217,7 +219,11 @@ def _write_track_bucket(
     temporary = temporary_file(output)
     temporary.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = open_database(config, output_reserve_bytes=output_reserve_bytes)
+    connection = open_database(
+        config,
+        output_reserve_bytes=output_reserve_bytes,
+        workload="bucket",
+    )
     try:
         count = int(
             connection.execute(
@@ -248,14 +254,10 @@ def prepare_data(
     manifest["git_commit"] = git_commit(project_root)
 
     partition_root = config.storage.work_root / "stage02_partitioned"
-    month_progress = tqdm(
-        months.items(),
-        total=len(months),
-        desc="partition months",
-        disable=not config.runtime.enable_progress,
-        dynamic_ncols=True,
-    )
-    for month, month_records in month_progress:
+    month_work: list[Dict[str, Any]] = []
+    month_estimator = ProgressEstimator(max_workers=1)
+    completed_months = 0
+    for month, month_records in months.items():
         source_signature = signature(
             (record["date"], record["input_identity"], record["config_hash"])
             for record in month_records
@@ -263,14 +265,44 @@ def prepare_data(
         year, month_number = month.split("-")
         output = partition_root / f"year={year}" / f"month={month_number}"
         key = f"partition:{month}"
-        if not force and item_is_complete(
-            manifest, key, stage_hash, source_signature, [output]
-        ):
-            continue
-
         source_bytes = total_file_size(
             Path(record["dynamic_path"]) for record in month_records
         )
+        if not force and item_is_complete(
+            manifest, key, stage_hash, source_signature, [output]
+        ):
+            completed_months += 1
+            item = manifest["items"][key]
+            month_estimator.add_sample(
+                int(item.get("source_bytes", source_bytes)),
+                float(item.get("elapsed_seconds", 0)),
+            )
+            continue
+        month_work.append(
+            {
+                "month": month,
+                "records": month_records,
+                "source_signature": source_signature,
+                "output": output,
+                "key": key,
+                "source_bytes": source_bytes,
+            }
+        )
+
+    month_remaining_bytes = sum(item["source_bytes"] for item in month_work)
+    month_progress = tqdm(
+        total=len(months),
+        initial=completed_months,
+        desc="partition months",
+        disable=not config.runtime.enable_progress,
+        dynamic_ncols=True,
+        bar_format=HONEST_BAR_FORMAT,
+    )
+    for item in month_work:
+        month = item["month"]
+        month_records = item["records"]
+        source_bytes = item["source_bytes"]
+        output = item["output"]
         estimated_output_bytes = source_bytes * 2
         free_before = ensure_storage_budget(
             config,
@@ -278,17 +310,27 @@ def prepare_data(
             estimated_output_bytes,
         )
         month_progress.set_postfix_str(
-            f"{month} free={free_before / TIB:.2f}TiB"
+            f"{month} {month_estimator.format_eta(month_remaining_bytes)} "
+            f"free={free_before / TIB:.2f}TiB"
         )
         started = time.perf_counter()
         temporary = temporary_directory(output)
         remove_path(temporary, config.storage.work_root)
         temporary.parent.mkdir(parents=True, exist_ok=True)
+
+        def poll_month(active, unit=month, unit_started=started) -> None:
+            month_progress.set_postfix_str(
+                f"{unit} elapsed={format_duration(time.perf_counter() - unit_started)} "
+                f"{month_estimator.format_eta(month_remaining_bytes)}"
+            )
+            month_progress.refresh()
+
         worker = run_isolated(
             _copy_partitioned_month,
             config,
             [Path(record["dynamic_path"]) for record in month_records],
             temporary,
+            _on_poll=poll_month,
         )
         output_bytes = directory_size(temporary)
         replace_directory(temporary, output, config.storage.work_root)
@@ -297,10 +339,10 @@ def prepare_data(
         io_mib_per_second = (
             (source_bytes + output_bytes) / 1024**2 / elapsed if elapsed else 0.0
         )
-        manifest["items"][key] = {
+        manifest["items"][item["key"]] = {
             "status": "complete",
             "config_hash": stage_hash,
-            "source_signature": source_signature,
+            "source_signature": item["source_signature"],
             "output": str(output.resolve()),
             "source_bytes": source_bytes,
             "output_bytes": output_bytes,
@@ -313,9 +355,15 @@ def prepare_data(
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        month_estimator.add_sample(source_bytes, elapsed)
+        month_remaining_bytes -= source_bytes
+        month_progress.update(1)
         month_progress.set_postfix_str(
-            f"{month} {io_mib_per_second:.1f}MiB/s free={free_after / TIB:.2f}TiB"
+            f"{month} {io_mib_per_second:.1f}MiB/s "
+            f"{month_estimator.format_eta(month_remaining_bytes)} "
+            f"free={free_after / TIB:.2f}TiB"
         )
+    month_progress.close()
 
     static_paths = [Path(record["static_path"]) for record in records]
     static_signature = signature(
@@ -333,8 +381,27 @@ def prepare_data(
             source_bytes,
         )
         started = time.perf_counter()
+        static_progress = tqdm(
+            total=1,
+            desc="compact static AIS",
+            disable=not config.runtime.enable_progress,
+            dynamic_ncols=True,
+            bar_format=HONEST_BAR_FORMAT,
+        )
+
+        def poll_static(active) -> None:
+            static_progress.set_postfix_str(
+                f"elapsed={format_duration(time.perf_counter() - started)} "
+                "ETA calibrating"
+            )
+            static_progress.refresh()
+
         worker = run_isolated(
-            _compact_static, config, static_paths, static_output
+            _compact_static,
+            config,
+            static_paths,
+            static_output,
+            _on_poll=poll_static,
         )
         vessel_count = worker.value
         elapsed = time.perf_counter() - started
@@ -355,66 +422,136 @@ def prepare_data(
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        static_progress.update(1)
+        static_progress.set_postfix_str(
+            f"elapsed={format_duration(elapsed)} free={free_after / TIB:.2f}TiB"
+        )
+        static_progress.close()
 
     bucket_sources = _bucket_files(partition_root)
     tracks_root = config.storage.work_root / "stage03_tracks"
-    bucket_progress = tqdm(
-        sorted(bucket_sources.items()),
-        total=len(bucket_sources),
-        desc="sort MMSI buckets",
-        disable=not config.runtime.enable_progress,
-        dynamic_ncols=True,
+    bucket_work: list[Dict[str, Any]] = []
+    bucket_estimator = ProgressEstimator(
+        max_workers=config.runtime.bucket_workers
     )
-    for bucket, paths in bucket_progress:
+    completed_buckets = 0
+    for bucket, paths in sorted(bucket_sources.items()):
         source_signature = signature(
             (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
             for path in paths
         )
         output = tracks_root / f"mmsi_bucket={bucket:04d}" / "part.parquet"
         key = f"track:{bucket:04d}"
+        source_bytes = total_file_size(paths)
         if not force and item_is_complete(
             manifest, key, stage_hash, source_signature, [output]
         ):
+            completed_buckets += 1
+            item = manifest["items"][key]
+            bucket_estimator.add_sample(
+                int(item.get("source_bytes", source_bytes)),
+                float(item.get("elapsed_seconds", 0)),
+            )
             continue
-        source_bytes = total_file_size(paths)
-        estimated_output_bytes = source_bytes * 2
-        free_before = ensure_storage_budget(
+        bucket_work.append(
+            {
+                "bucket": bucket,
+                "paths": paths,
+                "source_signature": source_signature,
+                "output": output,
+                "key": key,
+                "source_bytes": source_bytes,
+                "estimated_output_bytes": source_bytes * 2,
+            }
+        )
+
+    bucket_remaining_bytes = sum(item["source_bytes"] for item in bucket_work)
+    bucket_remaining_count = len(bucket_work)
+    bucket_progress = tqdm(
+        total=len(bucket_sources),
+        initial=completed_buckets,
+        desc="sort MMSI buckets",
+        disable=not config.runtime.enable_progress,
+        dynamic_ncols=True,
+        bar_format=HONEST_BAR_FORMAT,
+    )
+    work_by_key = {item["key"]: item for item in bucket_work}
+    free_before_by_key: Dict[str, int] = {}
+
+    def before_bucket_start(call, active) -> None:
+        item = work_by_key[call.key]
+        active_output = sum(
+            work_by_key[key]["estimated_output_bytes"] for key in active
+        )
+        free_before_by_key[call.key] = ensure_parallel_storage_budget(
             config,
-            f"sort MMSI bucket {bucket:04d}",
-            estimated_output_bytes,
+            f"sort MMSI bucket {item['bucket']:04d}",
+            active_output,
+            item["estimated_output_bytes"],
+        )
+
+    def poll_buckets(active) -> None:
+        active_text = ",".join(
+            f"{work_by_key[key]['bucket']:04d}" for key in sorted(active)
         )
         bucket_progress.set_postfix_str(
-            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
+            f"active={active_text or '-'} "
+            f"{bucket_estimator.format_eta(bucket_remaining_bytes, bucket_remaining_count)}"
         )
-        started = time.perf_counter()
-        worker = run_isolated(
-            _write_track_bucket, config, paths, bucket, output
+        bucket_progress.refresh()
+
+    calls = [
+        IsolatedCall(
+            key=item["key"],
+            target=_write_track_bucket,
+            args=(
+                config,
+                item["paths"],
+                item["bucket"],
+                item["output"],
+            ),
         )
-        track_rows = worker.value
-        elapsed = time.perf_counter() - started
-        output_bytes = output.stat().st_size
+        for item in bucket_work
+    ]
+    for result in run_isolated_many(
+        calls,
+        max_workers=config.runtime.bucket_workers,
+        on_poll=poll_buckets,
+        before_start=before_bucket_start,
+    ):
+        item = work_by_key[result.key]
+        source_bytes = item["source_bytes"]
+        output_bytes = item["output"].stat().st_size
         free_after = free_space_bytes(config.storage.work_root)
         io_mib_per_second = (
-            (source_bytes + output_bytes) / 1024**2 / elapsed if elapsed else 0.0
+            (source_bytes + output_bytes) / 1024**2 / result.elapsed_seconds
+            if result.elapsed_seconds
+            else 0.0
         )
-        manifest["items"][key] = {
+        manifest["items"][result.key] = {
             "status": "complete",
             "config_hash": stage_hash,
-            "source_signature": source_signature,
-            "output": str(output.resolve()),
-            "track_row_count": track_rows,
+            "source_signature": item["source_signature"],
+            "output": str(item["output"].resolve()),
+            "track_row_count": result.value,
             "source_bytes": source_bytes,
             "output_bytes": output_bytes,
             "io_mib_per_second": round(io_mib_per_second, 2),
-            "free_space_bytes_before": free_before,
+            "free_space_bytes_before": free_before_by_key[result.key],
             "free_space_bytes_after": free_after,
-            "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(elapsed, 3),
+            "worker_process_id": result.process_id,
+            "elapsed_seconds": round(result.elapsed_seconds, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        bucket_estimator.add_sample(source_bytes, result.elapsed_seconds)
+        bucket_remaining_bytes -= source_bytes
+        bucket_remaining_count -= 1
+        bucket_progress.update(1)
         bucket_progress.set_postfix_str(
-            f"{bucket:04d} {io_mib_per_second:.1f}MiB/s "
+            f"{item['bucket']:04d} {io_mib_per_second:.1f}MiB/s "
+            f"{bucket_estimator.format_eta(bucket_remaining_bytes, bucket_remaining_count)} "
             f"free={free_after / TIB:.2f}TiB"
         )
+    bucket_progress.close()
     return manifest

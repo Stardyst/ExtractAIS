@@ -22,7 +22,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-当前版本应显示 `1.3.0`。
+当前版本应显示 `1.4.0`。
 
 ## 2. 准备生产配置
 
@@ -47,7 +47,21 @@ storage:
   temp_directory: "E:/AIS2021-2022/derived/tmp"
 ```
 
-`configs/production.yaml` 已由 `.gitignore` 排除。路径、线程数和内存限制可以按主机调整；生产主机的 128 GB 内存建议保持 `threads: 20`、`memory_limit: "100GB"`，为系统和文件缓存保留余量。`minimum_free_space_gb: 500` 表示每个工作单元开始前必须为工作盘保留 500 GiB，此外还必须容纳该单元的预计输出。该检查覆盖全部阶段，DuckDB 临时文件也受到同一预算限制。
+`configs/production.yaml` 已由 `.gitignore` 排除。当前 128 GB、24 核/32 线程、单块 HDD 主机使用两个资源档位：
+
+```yaml
+runtime:
+  threads: 20
+  memory_limit: "90GB"
+  bucket_workers: 2
+  bucket_threads: 10
+  bucket_memory_limit: "42GB"
+  bucket_temp_limit_gb: 256
+  enable_progress: true
+  minimum_free_space_gb: 500
+```
+
+月度分区、静态表、全局港口锚点和验证报告使用全局档位；MMSI 分桶排序、停留、停留到港口匹配、港口调用和区间构建使用两个并发桶工人。单 HDD 不建议继续增加 `bucket_workers`，否则随机读写和磁头寻道通常会抵消并行收益。旧配置缺少上述资源字段时会采用这里的默认值，`status` 不再因缺少 `threads` 报错。
 
 ## 3. 先检查输入
 
@@ -106,9 +120,9 @@ extractais --config configs/production.yaml validate
 | `split` | 每个 CSV 只解析一次；动态报文与静态报文立即分离为 Parquet | 每日文件 |
 | `prepare` | 静态信息压缩到每 MMSI 一行；动态信息按月一次扫描并分桶；每桶按 MMSI/时间排序、去重、标记异常 | 月、MMSI 桶 |
 | `stops` | 从低速、连续、有限空间范围的位置点中提取停留事件 | MMSI 桶 |
-| `ports` | 读取 WPI，合并无法区分的近邻港口，建立停留支持的多圆锚点及空间索引 | 整个港口目录 |
+| `ports` | 读取 WPI，合并无法区分的近邻港口，建立多圆锚点，再按桶匹配停留事件 | 全局目录、MMSI 桶 |
 | `calls` | 精确计算位置到锚点距离，保留候选港口，使用独立检测的停留事件确认港口调用 | MMSI 桶 |
-| `intervals` | 识别五状态、插入长中断、压缩连续状态并按年份输出 | MMSI 桶、年度导出 |
+| `intervals` | 识别五状态、插入长中断、压缩连续状态并直接写入年度最终目录 | MMSI 桶 |
 | `validate` | 汇总港口覆盖、调用、歧义、Harbor Size 和状态质量 | 整个验证报告 |
 
 ## 6. 中断和恢复
@@ -128,7 +142,7 @@ extractais --config configs/production.yaml run-all
 - 检查点位于 `derived/manifests/*.json`，包含输入身份、阶段参数哈希、Git commit、子进程 PID、耗时和输出路径。
 - `--force` 会重建该命令所有已完成工作单元，只在确认需要重算时使用。
 
-子进程隔离边界与恢复粒度一致：`split` 为每日文件，`prepare` 为月/静态表/MMSI 桶，`stops`、`calls` 和区间构建为 MMSI 桶，`ports`、年度导出和 `validate` 各为一个整体单元。任意时刻只运行一个重型子进程，不会因为隔离而并发占用多份 `memory_limit`。
+子进程隔离边界与恢复粒度一致：`split` 为每日文件，`prepare` 为月/静态表/MMSI 桶，`stops`、停留到港口匹配、`calls` 和 `intervals` 为 MMSI 桶，港口锚点和 `validate` 为全局单元。全局单元一次运行一个进程；桶阶段最多同时运行 `bucket_workers` 个进程，每个进程严格使用桶档位的线程、内存和独立临时目录。
 
 ### 从旧版本继续现有任务
 
@@ -139,40 +153,18 @@ git pull origin main
 conda activate extractais
 python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
-extractais --config configs/production.yaml split
+extractais --config configs/production.yaml status
 ```
 
-不需要删除 `derived`，也不要加 `--force`。原 manifest 中已经完成的日期会直接跳过；中断时正在处理且尚未提交的日期会重算。旧记录没有新增审计字段属于正常情况，新完成记录会补充这些字段。
+版本应为 `1.4.0`。不需要删除 `derived`，也不要加 `--force`。旧 `configs/production.yaml` 即使缺少新资源字段也能加载；建议按第 2 节补齐字段，让实际资源配置可审计。
 
-正在运行旧版 `prepare` 时，停止旧进程并完成上述更新后执行：
+当前是在 `prepare` 中途暂停时，继续执行：
 
 ```powershell
 extractais --config configs/production.yaml prepare
 ```
 
-版本应为 `1.3.0`。在继续 `prepare` 前，将实际使用的 `configs/production.yaml` 更新为：
-
-```yaml
-runtime:
-  minimum_free_space_gb: 500
-
-prepare:
-  mmsi_buckets: 256
-  partition_write_max_open_files: 100
-  compression: "zstd"
-  row_group_size: 250000
-  max_implied_speed_knots: 80
-```
-
-`mmsi_buckets` 从 512 改为 256 后，旧版已经提交的月份会因 prepare 配置哈希变化而重新生成；中断时未提交的 `.tmp` 月份也会重算。不需要手工删除 `derived`，更不能混用 512 桶和 256 桶的月度目录。新完成月份会在 `manifests/prepare.json` 中记录输入/输出字节、行数、实际 MiB/s、执行前后剩余空间和子进程 PID。
-
-查看目前进度和最终路径：
-
-```powershell
-extractais --config configs/production.yaml status
-```
-
-从早期 `0.1.0` 版本升级时，`split` 的哈希由全局配置改为阶段配置。旧版已经完成的少量日期会重新处理一次，此后修改港口参数不会使 CSV 分离失效。
+已经提交的月份和桶保持有效；暂停时尚未提交的最小工作单元会重算。不要在同一份 `derived` 中改变 `prepare.mmsi_buckets`；若当前已使用 256，应继续保持 256。新版从 `stops` 开始采用双桶并发，`ports` 会补建分桶停留匹配，`calls` 会补建紧凑港口上下文，`intervals` 会直接生成最终年度文件，因此后续旧检查点若缺少新产物会自动重算。
 
 ## 7. 输出位置
 
@@ -189,10 +181,15 @@ derived/
   stage03_tracks/mmsi_bucket=NNNN/part.parquet
   stage04_stops/mmsi_bucket=NNNN/part.parquet
   stage05_ports/
+    anchors.parquet
+    anchor_tiles.parquet
+    stop_port_matches/mmsi_bucket=NNNN/part.parquet
   stage06_port_calls/mmsi_bucket=NNNN/
-  stage07_intervals/mmsi_bucket=NNNN/part.parquet
+    candidates.parquet
+    port_context.parquet
+    port_calls.parquet
   outputs/
-    trajectory_intervals/year=YYYY/*.parquet
+    trajectory_intervals/year=YYYY/mmsi_bucket=NNNN.parquet
     validation/
 ```
 
@@ -235,7 +232,9 @@ E:/AIS2021-2022/derived/outputs/trajectory_intervals/year=2022/*.parquet
 | `stage05_ports/anchors.parquet` | 每个锚点的位置、停留次数、船数、最近 WPI 距离 |
 | `stage05_ports/unmatched_anchor_candidates.parquet` | 有停留支持但未分配给 WPI 的区域 |
 | `stage05_ports/port_coverage.parquet` | 每个港口组的锚点覆盖情况 |
+| `stage05_ports/stop_port_matches/*/part.parquet` | 每个停留事件到最近港口锚点的分桶匹配及距离 |
 | `stage06_port_calls/*/candidates.parquet` | 每个近港位置的全部候选港口、精确距离、名次和原始源标签 |
+| `stage06_port_calls/*/port_context.parquet` | 每个近港位置的第一、第二候选及歧义距离，供调用、区间和验证复用 |
 | `stage06_port_calls/*/port_calls.parquet` | 已确认港口调用及停留、`at_dock`、歧义证据 |
 | `outputs/validation/port_quality.csv` | 每个港口组的覆盖、调用、歧义和审查状态 |
 | `outputs/validation/harbor_size_quality.csv` | 按 Large/Medium/Small/Very Small 分层的效果 |
@@ -266,35 +265,40 @@ extractais --config configs/production.yaml validate
 
 ## 11. 性能和磁盘
 
-- `split` 按原始字节显示总进度，DuckDB 同时显示当前查询进度；每个日期完成后显示该日压缩率和工作盘剩余 TiB。
+- `split` 按原始字节显示总进度；每个日期完成后显示该日压缩率和工作盘剩余 TiB。
 - `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
 - 恢复时总进度从已完成文件的真实字节数开始，跳过旧日期不会再产生虚假的 TB/s 瞬时速度。
 - 每个重型工作单元由独立子进程执行，修复了长时间运行中 DuckDB 连接虽然关闭、但同一 Python 进程的原生分配器和缓存仍持续累积而导致的吞吐衰减。
 - `prepare` 使用 256 个 MMSI 桶，使当前实测月度输入平均每桶约 119 MiB；同时打开的分区文件独立限制为 100，避免 HDD 同时维护全部 Parquet 写入流和大 row-group 缓冲。
 - 生产 `row_group_size` 为 250000，降低分区写入峰值内存，并为后续单桶并行扫描保留足够的 row group。
 - 在同一份 1000 万行合成输入上，旧参数 `512/512/1000000` 的月分区写入耗时约 9.93 秒，新参数 `256/100/250000` 约 7.36 秒；新配置生成 536 个文件，而测试过的 64 文件上限会生成 831 个文件，因此未采用 64。
-- `prepare` 的月/桶进度显示该工作单元的实际压缩读写 MiB/s 和剩余 TiB；这比外层 `it/s` 更适合判断吞吐是否稳定。
-- 后续阶段按月或 MMSI 桶显示进度，单桶可以使用磁盘临时空间完成外部排序。
+- DuckDB 内部进度条已关闭，因为其算子百分比不包含阻塞算子的收尾、Parquet flush 和文件替换，曾把剩余时间低估到实际值的约四分之一。
+- 主进度条只使用已经完整提交的相同工作单元计算 ETA。没有实测样本时显示 `ETA calibrating`；随后采用最近 12 个单元的中位吞吐率，并在尾部按实际剩余工人数修正。该 ETA 包含完整查询和输出收尾时间，不使用当前 DuckDB 算子百分比。
+- 桶阶段显示两个活动桶、已提交桶数、实测 MiB/s、ETA 和剩余 TiB。`prepare` 排序、`stops`、停留匹配、`calls`、`intervals` 均使用相同调度器。
 - 动态分桶按月只扫描一次，不会为 256 个桶重复扫描全年数据。
+- 停留到港口匹配按 MMSI 桶保存，不再生成一个全局匹配大表；港口调用生成一次紧凑 `port_context`，区间和验证复用它；区间直接写最终年度文件，不再保留并再次扫描一份 `stage07_intervals`。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。
 - `temp_directory` 必须和 `work_root` 位于容量充足的工作盘；不要指向系统盘。
-- 空间保护要求 `free >= minimum_free_space + estimated_output`。未配置时 `minimum_free_space_gb` 默认 500；如果不满足，命令会在创建下一个临时输出前报 `Storage guard stopped`，当前已完成检查点不会受损。
+- 全局任务要求 `free >= minimum_free_space + estimated_output`。桶任务还会预留 `bucket_workers * bucket_temp_limit_gb` 和所有活动桶的预计输出；默认配置仅这两项固定预留即为 `500 + 2 * 256 = 1012 GiB`。不满足时会在启动下一个子进程前报 `Storage guard stopped`，已提交检查点不受损。
 - 不要手工删除阶段目录后再执行 `run-all`。当前版本把中间产物视为可复现检查点，删除后会按依赖关系重建。
 
-当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%。据此估计完整 `split` 约 1.03 TiB，完整流程峰值约 3.05 TiB；4.43 TiB 可用空间能够容纳，并保留约 1 TiB 余量。
+当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%，据此估计完整 `split` 约 1.03 TiB。后续候选港口规模依赖真实近港密度，不能仅由 CSV 压缩率可靠外推；应以每阶段 manifest 的 `source_bytes`、`output_bytes` 和空间保护结果为准。
 
-### 诊断 prepare 性能
+### 诊断任意阶段性能
 
-在 `prepare` 正在执行耗时查询时，另开一个已激活 `extractais` 环境的 PowerShell 窗口运行：
+在 `prepare`、`stops`、`ports`、`calls`、`intervals` 或 `validate` 正在运行时，另开一个已激活 `extractais` 环境的 PowerShell 窗口运行：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/diagnose_prepare.ps1 `
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/diagnose_pipeline.ps1 `
   -Config configs/production.yaml `
+  -Stage Auto `
   -DurationMinutes 5 `
   -IntervalSeconds 5
 ```
 
-脚本只读取配置、manifest、文件大小和 Windows CIM 性能计数器，不停止进程、不修改派生数据，也不创建报告文件。它会识别当前月度分桶、静态压缩或 MMSI 桶排序任务，并输出进程 CPU/内存/句柄、物理盘吞吐和队列、DuckDB 临时目录增长、分区文件数量及瓶颈判断。诊断时应保留控制台中的 `Summary` 和 `Findings`。
+脚本只读取配置、临时输出和 Windows CIM 性能计数器，不停止进程、不修改派生数据，也不创建报告文件。它会自动识别阶段并输出整个进程树的 CPU/内存/句柄、物理盘吞吐和队列、DuckDB 临时目录增长、输出增长及瓶颈判断。需要限定阶段时可把 `Auto` 改为具体命令名。`diagnose_prepare.ps1` 仍可用于查看 `prepare` 的月度分区细节。
+
+从旧版升级后，只有在新版 `intervals` 和 `validate` 都成功完成并核对最终输出后，旧的 `derived/stage07_intervals` 和旧单文件 `derived/stage05_ports/stop_port_matches.parquet` 才是未被读取的冗余产物；新版不会自动删除既有数据。
 
 检查工作盘剩余空间：
 

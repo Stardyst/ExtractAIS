@@ -96,6 +96,22 @@ def _status(config: AppConfig) -> dict[str, Any]:
         "work_root": str(config.storage.work_root.resolve()),
         "free_space_gb": round(free_space_gb, 2),
         "minimum_free_space_gb": config.runtime.minimum_free_space_gb,
+        "runtime_profiles": {
+            "global": {
+                "threads": config.runtime.threads,
+                "memory_limit": config.runtime.memory_limit,
+            },
+            "bucket": {
+                "workers": config.runtime.bucket_workers,
+                "threads_per_worker": config.runtime.bucket_threads,
+                "memory_limit_per_worker": (
+                    config.runtime.bucket_memory_limit
+                ),
+                "temp_limit_gb_per_worker": (
+                    config.runtime.bucket_temp_limit_gb
+                ),
+            },
+        },
         "prepare_settings": {
             "mmsi_buckets": config.prepare.mmsi_buckets,
             "partition_write_max_open_files": (

@@ -9,15 +9,19 @@ from typing import Any, Dict, Iterable
 
 from tqdm import tqdm
 
+from extractais.bucketstage import BucketExecution, BucketTask, run_bucket_stage
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql, sql_literal
 from extractais.fileutils import (
     remove_path,
     replace_directory,
+    replace_file,
     temporary_directory,
+    temporary_file,
 )
 from extractais.gitmeta import git_commit
-from extractais.isolated import run_isolated
+from extractais.isolated import IsolatedCall, run_isolated
+from extractais.progress import HONEST_BAR_FORMAT, format_duration
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -27,6 +31,7 @@ from extractais.stage import (
     utc_now,
 )
 from extractais.storage import (
+    TIB,
     directory_size,
     ensure_storage_budget,
     free_space_bytes,
@@ -337,40 +342,6 @@ def _write_anchor_tables(
         )
     )
 
-    stop_distance = haversine_km(
-        "s.centroid_latitude", "s.centroid_longitude", "a.latitude", "a.longitude"
-    )
-    connection.execute(f"""
-        CREATE TEMP TABLE stop_port_matches AS
-        WITH possible AS (
-            SELECT
-                s.stop_id, s.mmsi, s.start_time_utc, s.end_time_utc,
-                a.anchor_id, a.port_group_id, a.port_group_name,
-                {stop_distance} AS anchor_distance_km
-            FROM {stop_source} s
-            JOIN anchor_matches a
-              ON abs(s.centroid_latitude - a.latitude) <= {config.ports.entry_radius_km / 111.0 + 0.01}
-             AND abs(((s.centroid_longitude - a.longitude + 540.0) % 360.0) - 180.0) <= 0.25
-        ),
-        ranked AS (
-            SELECT *, row_number() OVER (
-                PARTITION BY stop_id ORDER BY anchor_distance_km, anchor_id
-            ) AS match_rank
-            FROM possible
-            WHERE anchor_distance_km <= {config.ports.entry_radius_km}
-        )
-        SELECT * EXCLUDE (match_rank) FROM ranked WHERE match_rank = 1
-    """)
-    connection.execute(
-        parquet_copy_sql(
-            "SELECT * FROM stop_port_matches ORDER BY mmsi, start_time_utc",
-            output_root / "stop_port_matches.parquet",
-            config.prepare.compression,
-            config.prepare.row_group_size,
-        )
-    )
-
-
 def _anchor_tile_rows(anchor_rows: Iterable[tuple], radius_km: float) -> list[tuple]:
     rows: list[tuple] = []
     for anchor_id, latitude, longitude in anchor_rows:
@@ -439,7 +410,7 @@ def _build_port_catalog_worker(
     ports, groups = _assign_port_groups(
         ports,
         config.ports.group_distance_km,
-        config.runtime.enable_progress,
+        False,
     )
     connection = open_database(
         config,
@@ -456,6 +427,70 @@ def _build_port_catalog_worker(
         }
     finally:
         connection.close()
+
+
+def _write_stop_port_matches_bucket(
+    config: AppConfig,
+    stop_path: Path,
+    anchors_path: Path,
+    output: Path,
+) -> int:
+    stops = parquet_sources([stop_path])
+    anchors = parquet_sources([anchors_path])
+    distance = haversine_km(
+        "s.centroid_latitude", "s.centroid_longitude", "a.latitude", "a.longitude"
+    )
+    select_sql = f"""
+        WITH possible AS (
+            SELECT
+                s.stop_id, s.mmsi, s.mmsi_bucket,
+                s.start_time_utc, s.end_time_utc,
+                a.anchor_id, a.port_group_id, a.port_group_name,
+                {distance} AS anchor_distance_km
+            FROM {stops} s
+            JOIN {anchors} a
+              ON abs(s.centroid_latitude - a.latitude)
+                    <= {config.ports.entry_radius_km / 111.0 + 0.01}
+             AND abs(((s.centroid_longitude - a.longitude + 540.0) % 360.0) - 180.0)
+                    <= 0.25
+        ),
+        ranked AS (
+            SELECT *, row_number() OVER (
+                PARTITION BY stop_id ORDER BY anchor_distance_km, anchor_id
+            ) AS match_rank
+            FROM possible
+            WHERE anchor_distance_km <= {config.ports.entry_radius_km}
+        )
+        SELECT * EXCLUDE (match_rank)
+        FROM ranked
+        WHERE match_rank = 1
+    """
+    temporary = temporary_file(output)
+    temporary.unlink(missing_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    connection = open_database(
+        config,
+        output_reserve_bytes=stop_path.stat().st_size,
+        workload="bucket",
+    )
+    try:
+        count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    select_sql,
+                    temporary,
+                    config.prepare.compression,
+                    config.prepare.row_group_size,
+                )
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    try:
+        replace_file(temporary, output)
+        return count
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def build_ports(
@@ -479,54 +514,167 @@ def build_ports(
     manifest["config_hash"] = stage_hash
     manifest["git_commit"] = git_commit(project_root)
     output_root = config.storage.work_root / "stage05_ports"
-    required = [
+    catalog_required = [
         output_root / name
         for name in (
             "port_catalog.parquet", "port_groups.parquet", "anchors.parquet",
-            "unmatched_anchor_candidates.parquet", "stop_port_matches.parquet",
+            "unmatched_anchor_candidates.parquet",
             "anchor_tiles.parquet", "port_coverage.parquet",
         )
     ]
-    if not force and item_is_complete(
-        manifest, "catalog", stage_hash, source_signature, required
+    if force or not item_is_complete(
+        manifest, "catalog", stage_hash, source_signature, catalog_required
     ):
-        return manifest
+        started = time.perf_counter()
+        estimated_output_bytes = (
+            total_file_size(stop_paths) * 2 + config.input.ports_csv.stat().st_size
+        )
+        free_before = ensure_storage_budget(
+            config,
+            "build port catalog",
+            estimated_output_bytes,
+        )
+        catalog_progress = tqdm(
+            total=1,
+            desc="build port anchors",
+            disable=not config.runtime.enable_progress,
+            dynamic_ncols=True,
+            bar_format=HONEST_BAR_FORMAT,
+        )
 
-    started = time.perf_counter()
-    estimated_output_bytes = (
-        total_file_size(stop_paths) * 2 + config.input.ports_csv.stat().st_size
+        def poll_catalog(active) -> None:
+            catalog_progress.set_postfix_str(
+                f"elapsed={format_duration(time.perf_counter() - started)} "
+                "ETA calibrating"
+            )
+            catalog_progress.refresh()
+
+        temporary = temporary_directory(output_root)
+        remove_path(temporary, config.storage.work_root)
+        temporary.mkdir(parents=True, exist_ok=True)
+        worker = run_isolated(
+            _build_port_catalog_worker,
+            config,
+            stop_paths,
+            temporary,
+            _on_poll=poll_catalog,
+        )
+        counts = worker.value
+        output_bytes = directory_size(temporary)
+        replace_directory(temporary, output_root, config.storage.work_root)
+        free_after = free_space_bytes(config.storage.work_root)
+        elapsed = time.perf_counter() - started
+        manifest["items"]["catalog"] = {
+            "status": "complete",
+            "config_hash": stage_hash,
+            "source_signature": source_signature,
+            "output": str(output_root.resolve()),
+            "port_count": counts["port_count"],
+            "port_group_count": counts["port_group_count"],
+            "source_bytes": total_file_size(stop_paths),
+            "output_bytes": output_bytes,
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
+            "worker_process_id": worker.process_id,
+            "elapsed_seconds": round(elapsed, 3),
+            "completed_at_utc": utc_now(),
+        }
+        save_stage_manifest(manifest_path, manifest)
+        catalog_progress.update(1)
+        catalog_progress.set_postfix_str(
+            f"elapsed={format_duration(elapsed)} free={free_after / TIB:.2f}TiB"
+        )
+        catalog_progress.close()
+
+    anchors_path = output_root / "anchors.parquet"
+    match_root = output_root / "stop_port_matches"
+    anchor_identity = (
+        str(anchors_path.resolve()),
+        anchors_path.stat().st_size,
+        anchors_path.stat().st_mtime_ns,
     )
-    free_before = ensure_storage_budget(
+    tasks: list[BucketTask] = []
+    work: Dict[str, Dict[str, Any]] = {}
+    completed_samples: list[tuple[int, float]] = []
+    completed_count = 0
+    for stop_path in stop_paths:
+        bucket = int(stop_path.parent.name.split("=", 1)[1])
+        output = match_root / f"mmsi_bucket={bucket:04d}" / "part.parquet"
+        key = f"stop_match:{bucket:04d}"
+        match_signature = signature(
+            [
+                (
+                    str(stop_path.resolve()),
+                    stop_path.stat().st_size,
+                    stop_path.stat().st_mtime_ns,
+                ),
+                anchor_identity,
+            ]
+        )
+        source_bytes = stop_path.stat().st_size
+        if not force and item_is_complete(
+            manifest, key, stage_hash, match_signature, [output]
+        ):
+            completed_count += 1
+            item = manifest["items"][key]
+            completed_samples.append(
+                (
+                    int(item.get("source_bytes", source_bytes)),
+                    float(item.get("elapsed_seconds", 0)),
+                )
+            )
+            continue
+        work[key] = {
+            "source_signature": match_signature,
+            "source_bytes": source_bytes,
+            "output": output,
+        }
+        tasks.append(
+            BucketTask(
+                key=key,
+                label=f"{bucket:04d}",
+                source_bytes=source_bytes,
+                estimated_output_bytes=source_bytes,
+                call=IsolatedCall(
+                    key=key,
+                    target=_write_stop_port_matches_bucket,
+                    args=(config, stop_path, anchors_path, output),
+                ),
+            )
+        )
+
+    def complete_match(execution: BucketExecution) -> str:
+        item = work[execution.task.key]
+        output = item["output"]
+        output_bytes = output.stat().st_size
+        source_bytes = item["source_bytes"]
+        elapsed = execution.result.elapsed_seconds
+        io_rate = (source_bytes + output_bytes) / 1024**2 / elapsed
+        manifest["items"][execution.task.key] = {
+            "status": "complete",
+            "config_hash": stage_hash,
+            "source_signature": item["source_signature"],
+            "output": str(output.resolve()),
+            "stop_match_count": execution.result.value,
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "io_mib_per_second": round(io_rate, 2),
+            "free_space_bytes_before": execution.free_space_bytes_before,
+            "free_space_bytes_after": free_space_bytes(config.storage.work_root),
+            "worker_process_id": execution.result.process_id,
+            "elapsed_seconds": round(elapsed, 3),
+            "completed_at_utc": utc_now(),
+        }
+        save_stage_manifest(manifest_path, manifest)
+        return f"{io_rate:.1f}MiB/s"
+
+    run_bucket_stage(
         config,
-        "build port catalog",
-        estimated_output_bytes,
+        "match stops to ports",
+        tasks,
+        total_count=len(stop_paths),
+        completed_count=completed_count,
+        completed_samples=completed_samples,
+        on_complete=complete_match,
     )
-    temporary = temporary_directory(output_root)
-    remove_path(temporary, config.storage.work_root)
-    temporary.mkdir(parents=True, exist_ok=True)
-    worker = run_isolated(
-        _build_port_catalog_worker,
-        config,
-        stop_paths,
-        temporary,
-    )
-    counts = worker.value
-    output_bytes = directory_size(temporary)
-    replace_directory(temporary, output_root, config.storage.work_root)
-    free_after = free_space_bytes(config.storage.work_root)
-    manifest["items"]["catalog"] = {
-        "status": "complete",
-        "config_hash": stage_hash,
-        "source_signature": source_signature,
-        "output": str(output_root.resolve()),
-        "port_count": counts["port_count"],
-        "port_group_count": counts["port_group_count"],
-        "output_bytes": output_bytes,
-        "free_space_bytes_before": free_before,
-        "free_space_bytes_after": free_after,
-        "worker_process_id": worker.process_id,
-        "elapsed_seconds": round(time.perf_counter() - started, 3),
-        "completed_at_utc": utc_now(),
-    }
-    save_stage_manifest(manifest_path, manifest)
     return manifest

@@ -5,12 +5,15 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from tqdm import tqdm
+
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql, sql_literal
 from extractais.fileutils import remove_path, replace_directory, temporary_directory
 from extractais.gitmeta import git_commit
 from extractais.isolated import run_isolated
 from extractais.manifest import write_json_atomic
+from extractais.progress import HONEST_BAR_FORMAT, format_duration
 from extractais.sql import parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -42,14 +45,14 @@ def _build_validation_in_process(
             "mmsi_bucket=*/port_calls.parquet"
         )
     )
-    candidates = sorted(
+    contexts = sorted(
         (config.storage.work_root / "stage06_port_calls").glob(
-            "mmsi_bucket=*/candidates.parquet"
+            "mmsi_bucket=*/port_context.parquet"
         )
     )
     intervals = sorted(
-        (config.storage.work_root / "stage07_intervals").glob(
-            "mmsi_bucket=*/part.parquet"
+        (config.storage.work_root / "outputs" / "trajectory_intervals").glob(
+            "year=*/mmsi_bucket=*.parquet"
         )
     )
     ports_root = config.storage.work_root / "stage05_ports"
@@ -58,8 +61,8 @@ def _build_validation_in_process(
         ports_root / "port_coverage.parquet",
         ports_root / "unmatched_anchor_candidates.parquet",
     ]
-    dependencies = calls + candidates + intervals + port_dependencies
-    if not calls or not candidates or not intervals or not all(path.exists() for path in port_dependencies):
+    dependencies = calls + contexts + intervals + port_dependencies
+    if not calls or not contexts or not intervals or not all(path.exists() for path in port_dependencies):
         raise RuntimeError("Final-stage artifacts are incomplete; run `extractais intervals` first")
 
     source_signature = signature(
@@ -101,7 +104,7 @@ def _build_validation_in_process(
     )
     try:
         calls_source = parquet_sources(calls)
-        candidates_source = parquet_sources(candidates)
+        contexts_source = parquet_sources(contexts)
         intervals_source = parquet_sources(intervals)
         groups_source = parquet_sources([ports_root / "port_groups.parquet"])
         coverage_source = parquet_sources([ports_root / "port_coverage.parquet"])
@@ -110,7 +113,7 @@ def _build_validation_in_process(
         )
         connection.execute(f"CREATE TEMP VIEW all_calls AS SELECT * FROM {calls_source}")
         connection.execute(
-            f"CREATE TEMP VIEW all_candidates AS SELECT * FROM {candidates_source}"
+            f"CREATE TEMP VIEW all_contexts AS SELECT * FROM {contexts_source}"
         )
         connection.execute(
             f"CREATE TEMP VIEW all_intervals AS SELECT * FROM {intervals_source}"
@@ -151,15 +154,16 @@ def _build_validation_in_process(
             LEFT JOIN call_metrics m USING (port_group_id)
             ORDER BY review_status, port_call_count DESC, port_group_id
         """
+        connection.execute(f"CREATE TEMP TABLE port_quality AS {port_quality_sql}")
         connection.execute(
             parquet_copy_sql(
-                port_quality_sql,
+                "SELECT * FROM port_quality",
                 temporary / "port_quality.parquet",
                 config.prepare.compression,
                 config.prepare.row_group_size,
             )
         )
-        _csv_copy(connection, port_quality_sql, temporary / "port_quality.csv")
+        _csv_copy(connection, "SELECT * FROM port_quality", temporary / "port_quality.csv")
 
         harbor_sql = f"""
             SELECT
@@ -170,7 +174,7 @@ def _build_validation_in_process(
                 sum(calling_vessel_count) AS summed_calling_vessels,
                 avg(ambiguous_call_fraction) AS mean_ambiguous_call_fraction,
                 avg(stop_confirmed_fraction) AS mean_stop_confirmed_fraction
-            FROM ({port_quality_sql})
+            FROM port_quality
             GROUP BY harbor_size
             ORDER BY CASE harbor_size
                 WHEN 'Large' THEN 1 WHEN 'Medium' THEN 2 WHEN 'Small' THEN 3
@@ -192,23 +196,17 @@ def _build_validation_in_process(
 
         ambiguity_sql = f"""
             SELECT
-                first.mmsi, first.timestamp_utc, first.latitude, first.longitude,
-                first.port_group_id AS first_port_group_id,
-                first.port_group_name AS first_port_group_name,
-                first.port_distance_km AS first_distance_km,
-                second.port_group_id AS second_port_group_id,
-                second.port_group_name AS second_port_group_name,
-                second.port_distance_km AS second_distance_km,
-                second.port_distance_km - first.port_distance_km AS margin_km
-            FROM all_candidates first
-            JOIN all_candidates second
-              ON first.mmsi = second.mmsi
-             AND first.point_seq = second.point_seq
-             AND first.candidate_rank = 1
-             AND second.candidate_rank = 2
-            WHERE second.port_distance_km - first.port_distance_km
-                  < {config.ports.ambiguity_margin_km}
-            ORDER BY margin_km, first.mmsi, first.timestamp_utc
+                mmsi, timestamp_utc, latitude, longitude,
+                port_group_id AS first_port_group_id,
+                port_group_name AS first_port_group_name,
+                port_distance_km AS first_distance_km,
+                second_port_group_id,
+                second_port_group_name,
+                second_port_distance_km AS second_distance_km,
+                ambiguity_margin_km AS margin_km
+            FROM all_contexts
+            WHERE ambiguity_margin_km < {config.ports.ambiguity_margin_km}
+            ORDER BY margin_km, mmsi, timestamp_utc
             LIMIT 100000
         """
         connection.execute(
@@ -270,9 +268,31 @@ def _build_validation_in_process(
 def build_validation(
     config: AppConfig, project_root: Path, force: bool = False
 ) -> Dict[str, Any]:
-    return run_isolated(
+    started = time.perf_counter()
+    progress = tqdm(
+        total=1,
+        desc="build validation reports",
+        disable=not config.runtime.enable_progress,
+        dynamic_ncols=True,
+        bar_format=HONEST_BAR_FORMAT,
+    )
+
+    def on_poll(active) -> None:
+        progress.set_postfix_str(
+            f"elapsed={format_duration(time.perf_counter() - started)} "
+            "ETA calibrating"
+        )
+        progress.refresh()
+
+    worker = run_isolated(
         _build_validation_in_process,
         config,
         project_root,
         force,
-    ).value
+        _on_poll=on_poll,
+    )
+    elapsed = time.perf_counter() - started
+    progress.update(1)
+    progress.set_postfix_str(f"elapsed={format_duration(elapsed)}")
+    progress.close()
+    return worker.value

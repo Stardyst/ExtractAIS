@@ -21,7 +21,6 @@ runtime:
   threads: 2
   memory_limit: "1GB"
   enable_progress: false
-  progress_bar_time_ms: 1000
   minimum_free_space_gb: 0
 split:
   dynamic_message_types: [1, 2, 3, 18, 19, 27]

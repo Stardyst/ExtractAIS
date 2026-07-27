@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Dict
 
-from tqdm import tqdm
-
+from extractais.bucketstage import BucketExecution, BucketTask, run_bucket_stage
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql
 from extractais.fileutils import (
@@ -14,7 +12,7 @@ from extractais.fileutils import (
     temporary_directory,
 )
 from extractais.gitmeta import git_commit
-from extractais.isolated import run_isolated
+from extractais.isolated import IsolatedCall
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -23,12 +21,7 @@ from extractais.stage import (
     signature,
     utc_now,
 )
-from extractais.storage import (
-    TIB,
-    directory_size,
-    ensure_storage_budget,
-    free_space_bytes,
-)
+from extractais.storage import directory_size, free_space_bytes
 from extractais.stops import bucket_number, track_bucket_files
 
 
@@ -94,33 +87,23 @@ def _write_candidates(connection, config: AppConfig, track_path: Path, output: P
 
 
 def _write_port_calls(
-    connection, config: AppConfig, candidates_path: Path, output: Path
+    connection,
+    config: AppConfig,
+    context_path: Path,
+    stop_matches_path: Path,
+    output: Path,
 ) -> int:
-    candidates = parquet_sources([candidates_path])
-    stop_matches = parquet_sources(
-        [config.storage.work_root / "stage05_ports" / "stop_port_matches.parquet"]
-    )
+    context = parquet_sources([context_path])
+    stop_matches = parquet_sources([stop_matches_path])
     maximum_gap_seconds = int(config.ports.call_max_point_gap_hours * 3600)
     select_sql = f"""
-        WITH best AS (
-            SELECT
-                first.*,
-                second.port_distance_km AS second_port_distance_km,
-                second.port_distance_km - first.port_distance_km AS ambiguity_margin_km
-            FROM {candidates} first
-            LEFT JOIN {candidates} second
-              ON first.mmsi = second.mmsi
-             AND first.point_seq = second.point_seq
-             AND second.candidate_rank = 2
-            WHERE first.candidate_rank = 1
-        ),
-        previous AS (
+        WITH previous AS (
             SELECT
                 *,
                 lag(point_seq) OVER (PARTITION BY mmsi ORDER BY point_seq) AS previous_point_seq,
                 lag(port_group_id) OVER (PARTITION BY mmsi ORDER BY point_seq) AS previous_port_group_id,
                 lag(timestamp_utc) OVER (PARTITION BY mmsi ORDER BY point_seq) AS previous_time_utc
-            FROM best
+            FROM {context}
         ),
         marked AS (
             SELECT
@@ -197,16 +180,69 @@ def _write_port_calls(
     )
 
 
+def _write_port_context(
+    connection, config: AppConfig, candidates_path: Path, output: Path
+) -> int:
+    candidates = parquet_sources([candidates_path])
+    select_sql = f"""
+        SELECT
+            mmsi,
+            point_seq,
+            arg_min(timestamp_utc, candidate_rank) AS timestamp_utc,
+            arg_min(latitude, candidate_rank) AS latitude,
+            arg_min(longitude, candidate_rank) AS longitude,
+            arg_min(speed, candidate_rank) AS speed,
+            arg_min(source_at_dock, candidate_rank) AS source_at_dock,
+            arg_min(gap_seconds, candidate_rank) AS gap_seconds,
+            arg_min(mmsi_bucket, candidate_rank) AS mmsi_bucket,
+            arg_min(matched_port_name, candidate_rank) AS matched_port_name,
+            arg_min(source_label, candidate_rank) AS source_label,
+            arg_min(source_sublabel, candidate_rank) AS source_sublabel,
+            arg_min(collection_type, candidate_rank) AS collection_type,
+            arg_min(source, candidate_rank) AS source,
+            arg_min(port_group_id, candidate_rank) AS port_group_id,
+            arg_min(port_group_name, candidate_rank) AS port_group_name,
+            arg_min(nearest_anchor_id, candidate_rank) AS nearest_anchor_id,
+            max(port_group_id) FILTER (WHERE candidate_rank = 2)
+                AS second_port_group_id,
+            max(port_group_name) FILTER (WHERE candidate_rank = 2)
+                AS second_port_group_name,
+            min(port_distance_km) FILTER (WHERE candidate_rank = 1)
+                AS port_distance_km,
+            min(port_distance_km) FILTER (WHERE candidate_rank = 2)
+                AS second_port_distance_km,
+            min(port_distance_km) FILTER (WHERE candidate_rank = 2)
+                - min(port_distance_km) FILTER (WHERE candidate_rank = 1)
+                AS ambiguity_margin_km
+        FROM {candidates}
+        WHERE candidate_rank <= 2
+        GROUP BY mmsi, point_seq
+    """
+    return int(
+        connection.execute(
+            parquet_copy_sql(
+                select_sql,
+                output,
+                config.prepare.compression,
+                config.prepare.row_group_size,
+            )
+        ).fetchone()[0]
+    )
+
+
 def _write_port_call_bucket(
     config: AppConfig,
     track_path: Path,
+    stop_matches_path: Path,
     temporary_root: Path,
 ) -> Dict[str, int]:
     temporary_candidates = temporary_root / "candidates.parquet"
+    temporary_context = temporary_root / "port_context.parquet"
     temporary_calls = temporary_root / "port_calls.parquet"
     connection = open_database(
         config,
         output_reserve_bytes=track_path.stat().st_size * 4,
+        workload="bucket",
     )
     try:
         candidate_count = _write_candidates(
@@ -215,14 +251,22 @@ def _write_port_call_bucket(
             track_path,
             temporary_candidates,
         )
-        call_count = _write_port_calls(
+        context_count = _write_port_context(
             connection,
             config,
             temporary_candidates,
+            temporary_context,
+        )
+        call_count = _write_port_calls(
+            connection,
+            config,
+            temporary_context,
+            stop_matches_path,
             temporary_calls,
         )
         return {
             "candidate_count": candidate_count,
+            "context_count": context_count,
             "port_call_count": call_count,
         }
     finally:
@@ -237,7 +281,6 @@ def build_port_calls(
     dependencies = [
         ports_root / "anchors.parquet",
         ports_root / "anchor_tiles.parquet",
-        ports_root / "stop_port_matches.parquet",
     ]
     if not all(path.exists() for path in dependencies):
         raise RuntimeError("Port artifacts are incomplete; run `extractais ports` first")
@@ -247,25 +290,42 @@ def build_port_calls(
     stage_hash = config.stage_hash("ports", "prepare")
     manifest["config_hash"] = stage_hash
     manifest["git_commit"] = git_commit(project_root)
-    dependency_identity = [
+    global_dependency_identity = [
         (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
         for path in dependencies
     ]
     output_root = config.storage.work_root / "stage06_port_calls"
-    progress = tqdm(
-        tracks,
-        desc="recognize port calls",
-        disable=not config.runtime.enable_progress,
-        dynamic_ncols=True,
-    )
-    for track_path in progress:
+    tasks: list[BucketTask] = []
+    work: Dict[str, Dict[str, Any]] = {}
+    completed_samples: list[tuple[int, float]] = []
+    completed_count = 0
+    for track_path in tracks:
         bucket = bucket_number(track_path)
+        stop_matches_path = (
+            ports_root
+            / "stop_port_matches"
+            / f"mmsi_bucket={bucket:04d}"
+            / "part.parquet"
+        )
+        if not stop_matches_path.exists():
+            raise RuntimeError(
+                f"Stop-to-port matches are incomplete for bucket {bucket:04d}; "
+                "run `extractais ports` first"
+            )
         source_signature = signature(
             [(str(track_path.resolve()), track_path.stat().st_size, track_path.stat().st_mtime_ns)]
-            + dependency_identity
+            + global_dependency_identity
+            + [
+                (
+                    str(stop_matches_path.resolve()),
+                    stop_matches_path.stat().st_size,
+                    stop_matches_path.stat().st_mtime_ns,
+                )
+            ]
         )
         bucket_root = output_root / f"mmsi_bucket={bucket:04d}"
         candidates_output = bucket_root / "candidates.parquet"
+        context_output = bucket_root / "port_context.parquet"
         calls_output = bucket_root / "port_calls.parquet"
         key = f"bucket:{bucket:04d}"
         if not force and item_is_complete(
@@ -273,49 +333,82 @@ def build_port_calls(
             key,
             stage_hash,
             source_signature,
-            [candidates_output, calls_output],
+            [candidates_output, context_output, calls_output],
         ):
+            completed_count += 1
+            item = manifest["items"][key]
+            completed_samples.append(
+                (
+                    int(item.get("source_bytes", track_path.stat().st_size)),
+                    float(item.get("elapsed_seconds", 0)),
+                )
+            )
             continue
 
-        estimated_output_bytes = track_path.stat().st_size * 4
-        free_before = ensure_storage_budget(
-            config,
-            f"recognize calls in MMSI bucket {bucket:04d}",
-            estimated_output_bytes,
-        )
-        progress.set_postfix_str(
-            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
-        )
-        started = time.perf_counter()
         temporary_root = temporary_directory(bucket_root)
         remove_path(temporary_root, config.storage.work_root)
         temporary_root.mkdir(parents=True, exist_ok=True)
-        worker = run_isolated(
-            _write_port_call_bucket,
-            config,
-            track_path,
-            temporary_root,
+        source_bytes = track_path.stat().st_size + stop_matches_path.stat().st_size
+        work[key] = {
+            "source_signature": source_signature,
+            "source_bytes": source_bytes,
+            "bucket_root": bucket_root,
+            "temporary_root": temporary_root,
+        }
+        tasks.append(
+            BucketTask(
+                key=key,
+                label=f"{bucket:04d}",
+                source_bytes=source_bytes,
+                estimated_output_bytes=track_path.stat().st_size * 4,
+                call=IsolatedCall(
+                    key=key,
+                    target=_write_port_call_bucket,
+                    args=(config, track_path, stop_matches_path, temporary_root),
+                ),
+            )
         )
-        counts = worker.value
+
+    def complete(execution: BucketExecution) -> str:
+        item = work[execution.task.key]
+        counts = execution.result.value
+        temporary_root = item["temporary_root"]
+        bucket_root = item["bucket_root"]
         output_bytes = directory_size(temporary_root)
-        replace_directory(temporary_root, bucket_root, config.storage.work_root)
+        replace_directory(
+            temporary_root, bucket_root, config.storage.work_root
+        )
         free_after = free_space_bytes(config.storage.work_root)
-        manifest["items"][key] = {
+        elapsed = execution.result.elapsed_seconds
+        source_bytes = item["source_bytes"]
+        io_rate = (source_bytes + output_bytes) / 1024**2 / elapsed
+        manifest["items"][execution.task.key] = {
             "status": "complete",
             "config_hash": stage_hash,
-            "source_signature": source_signature,
+            "source_signature": item["source_signature"],
             "output": str(bucket_root.resolve()),
             "candidate_count": counts["candidate_count"],
+            "context_count": counts["context_count"],
             "port_call_count": counts["port_call_count"],
+            "source_bytes": source_bytes,
             "output_bytes": output_bytes,
-            "free_space_bytes_before": free_before,
+            "io_mib_per_second": round(io_rate, 2),
+            "free_space_bytes_before": execution.free_space_bytes_before,
             "free_space_bytes_after": free_after,
-            "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "worker_process_id": execution.result.process_id,
+            "elapsed_seconds": round(elapsed, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
-        progress.set_postfix_str(
-            f"{bucket:04d} free={free_after / TIB:.2f}TiB"
-        )
+        return f"{io_rate:.1f}MiB/s"
+
+    run_bucket_stage(
+        config,
+        "recognize port calls",
+        tasks,
+        total_count=len(tracks),
+        completed_count=completed_count,
+        completed_samples=completed_samples,
+        on_complete=complete,
+    )
     return manifest

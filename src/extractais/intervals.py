@@ -1,22 +1,17 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Dict
 
-from tqdm import tqdm
-
+from extractais.bucketstage import BucketExecution, BucketTask, run_bucket_stage
 from extractais.config import AppConfig
-from extractais.database import open_database, parquet_copy_sql, sql_literal
+from extractais.database import open_database, parquet_copy_sql
 from extractais.fileutils import (
     remove_path,
-    replace_directory,
     replace_file,
-    temporary_directory,
-    temporary_file,
 )
 from extractais.gitmeta import git_commit
-from extractais.isolated import run_isolated
+from extractais.isolated import IsolatedCall
 from extractais.sql import parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -25,13 +20,7 @@ from extractais.stage import (
     signature,
     utc_now,
 )
-from extractais.storage import (
-    TIB,
-    directory_size,
-    ensure_storage_budget,
-    free_space_bytes,
-    total_file_size,
-)
+from extractais.storage import free_space_bytes, total_file_size
 from extractais.stops import bucket_number, track_bucket_files
 
 
@@ -44,22 +33,22 @@ def _year_windows(config: AppConfig) -> str:
     return ", ".join(rows)
 
 
-def _write_interval_bucket(
-    connection,
+def _interval_select_sql(
     config: AppConfig,
     track_path: Path,
     candidates_path: Path,
+    context_path: Path,
     calls_path: Path,
-    output: Path,
-) -> int:
+) -> str:
     tracks = parquet_sources([track_path])
     candidates = parquet_sources([candidates_path])
+    context = parquet_sources([context_path])
     calls = parquet_sources([calls_path])
     groups = parquet_sources(
         [config.storage.work_root / "stage05_ports" / "port_groups.parquet"]
     )
     gap_threshold = int(config.intervals.unknown_gap_hours * 3600)
-    select_sql = f"""
+    return f"""
         WITH valid_tracks AS (
             SELECT
                 *,
@@ -106,9 +95,8 @@ def _write_interval_bucket(
                 t.*,
                 previous_candidate.port_distance_km AS previous_port_distance_km,
                 next_candidate.port_distance_km AS next_port_distance_km,
-                first_candidate.port_distance_km AS first_candidate_distance_km,
-                second_candidate.port_distance_km - first_candidate.port_distance_km
-                    AS candidate_margin_km
+                first_context.port_distance_km AS first_candidate_distance_km,
+                first_context.ambiguity_margin_km AS candidate_margin_km
             FROM with_calls t
             LEFT JOIN {candidates} previous_candidate
               ON t.mmsi = previous_candidate.mmsi
@@ -118,14 +106,9 @@ def _write_interval_bucket(
               ON t.mmsi = next_candidate.mmsi
              AND t.point_seq = next_candidate.point_seq
              AND t.to_port_group_id = next_candidate.port_group_id
-            LEFT JOIN {candidates} first_candidate
-              ON t.mmsi = first_candidate.mmsi
-             AND t.point_seq = first_candidate.point_seq
-             AND first_candidate.candidate_rank = 1
-            LEFT JOIN {candidates} second_candidate
-              ON t.mmsi = second_candidate.mmsi
-             AND t.point_seq = second_candidate.point_seq
-             AND second_candidate.candidate_rank = 2
+            LEFT JOIN {context} first_context
+              ON t.mmsi = first_context.mmsi
+             AND t.point_seq = first_context.point_seq
         ),
         classified AS (
             SELECT
@@ -275,74 +258,56 @@ def _write_interval_bucket(
             {bucket_number(track_path)}::INTEGER AS mmsi_bucket
         FROM named
         WHERE end_time_utc >= start_time_utc
-        ORDER BY mmsi, start_time_utc, state
     """
-    return int(
-        connection.execute(
-            parquet_copy_sql(
-                select_sql,
-                output,
-                config.prepare.compression,
-                config.prepare.row_group_size,
-            )
-        ).fetchone()[0]
-    )
 
 
 def _write_interval_bucket_worker(
     config: AppConfig,
     track_path: Path,
     candidates_path: Path,
+    context_path: Path,
     calls_path: Path,
-    output: Path,
-) -> int:
+    temporary_root: Path,
+) -> Dict[str, Any]:
     connection = open_database(
         config,
         output_reserve_bytes=track_path.stat().st_size,
+        workload="bucket",
     )
     try:
-        return _write_interval_bucket(
-            connection,
+        select_sql = _interval_select_sql(
             config,
             track_path,
             candidates_path,
+            context_path,
             calls_path,
-            output,
         )
+        connection.execute(f"CREATE TEMP TABLE interval_results AS {select_sql}")
+        counts: Dict[str, int] = {}
+        for year in sorted(config.input.year_directories):
+            output = temporary_root / f"year={year}" / "part.parquet"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            counts[str(year)] = int(
+                connection.execute(
+                    parquet_copy_sql(
+                        f"""
+                        SELECT *
+                        FROM interval_results
+                        WHERE year = {year}
+                        ORDER BY mmsi, start_time_utc, state
+                        """,
+                        output,
+                        config.prepare.compression,
+                        config.prepare.row_group_size,
+                    )
+                ).fetchone()[0]
+            )
+        return {
+            "year_counts": counts,
+            "interval_count": sum(counts.values()),
+        }
     finally:
         connection.close()
-
-
-def _export_yearly(config: AppConfig, sources: list[Path], output_root: Path) -> int:
-    temporary = temporary_directory(output_root)
-    remove_path(temporary, config.storage.work_root)
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    source = parquet_sources(sources)
-    connection = open_database(
-        config,
-        output_reserve_bytes=total_file_size(sources) * 2,
-    )
-    try:
-        exported_count = int(
-            connection.execute(f"""
-                COPY (
-                    SELECT * EXCLUDE (mmsi_bucket), mmsi_bucket
-                    FROM {source}
-                    ORDER BY year, mmsi, start_time_utc
-                )
-                TO {sql_literal(str(temporary.resolve()))}
-                (
-                    FORMAT PARQUET,
-                    PARTITION_BY (year),
-                    COMPRESSION {config.prepare.compression.upper()},
-                    ROW_GROUP_SIZE {config.prepare.row_group_size}
-                )
-            """).fetchone()[0]
-        )
-    finally:
-        connection.close()
-    replace_directory(temporary, output_root, config.storage.work_root)
-    return exported_count
 
 
 def build_intervals(
@@ -356,106 +321,117 @@ def build_intervals(
     stage_hash = config.stage_hash("intervals", "ports", "prepare")
     manifest["config_hash"] = stage_hash
     manifest["git_commit"] = git_commit(project_root)
-    segment_root = config.storage.work_root / "stage07_intervals"
-
-    progress = tqdm(
-        tracks,
-        desc="build state intervals",
-        disable=not config.runtime.enable_progress,
-        dynamic_ncols=True,
-    )
-    outputs: list[Path] = []
-    for track_path in progress:
+    output_root = config.storage.work_root / "outputs" / "trajectory_intervals"
+    temporary_parent = output_root / ".tmp"
+    tasks: list[BucketTask] = []
+    work: Dict[str, Dict[str, Any]] = {}
+    completed_samples: list[tuple[int, float]] = []
+    completed_count = 0
+    for track_path in tracks:
         bucket = bucket_number(track_path)
         calls_bucket = calls_root / f"mmsi_bucket={bucket:04d}"
         candidates_path = calls_bucket / "candidates.parquet"
+        context_path = calls_bucket / "port_context.parquet"
         calls_path = calls_bucket / "port_calls.parquet"
-        dependencies = [track_path, candidates_path, calls_path, groups_path]
+        dependencies = [
+            track_path,
+            candidates_path,
+            context_path,
+            calls_path,
+            groups_path,
+        ]
         if not all(path.exists() for path in dependencies):
             raise RuntimeError(f"Port-call outputs are incomplete for bucket {bucket:04d}")
         source_signature = signature(
             (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
             for path in dependencies
         )
-        output = segment_root / f"mmsi_bucket={bucket:04d}" / "part.parquet"
-        outputs.append(output)
+        outputs = [
+            output_root / f"year={year}" / f"mmsi_bucket={bucket:04d}.parquet"
+            for year in sorted(config.input.year_directories)
+        ]
         key = f"bucket:{bucket:04d}"
         if not force and item_is_complete(
-            manifest, key, stage_hash, source_signature, [output]
+            manifest, key, stage_hash, source_signature, outputs
         ):
+            completed_count += 1
+            item = manifest["items"][key]
+            completed_samples.append(
+                (
+                    int(item.get("source_bytes", total_file_size(dependencies))),
+                    float(item.get("elapsed_seconds", 0)),
+                )
+            )
             continue
-        estimated_output_bytes = track_path.stat().st_size
-        free_before = ensure_storage_budget(
-            config,
-            f"build intervals for MMSI bucket {bucket:04d}",
-            estimated_output_bytes,
-        )
-        progress.set_postfix_str(
-            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
-        )
-        started = time.perf_counter()
-        temporary = temporary_file(output)
-        temporary.unlink(missing_ok=True)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        worker = run_isolated(
-            _write_interval_bucket_worker,
-            config,
-            track_path,
-            candidates_path,
-            calls_path,
-            temporary,
-        )
-        replace_file(temporary, output)
-        output_bytes = output.stat().st_size
-        free_after = free_space_bytes(config.storage.work_root)
-        manifest["items"][key] = {
-            "status": "complete",
-            "config_hash": stage_hash,
+        temporary_root = temporary_parent / f"mmsi_bucket={bucket:04d}"
+        remove_path(temporary_root, config.storage.work_root)
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        source_bytes = total_file_size(dependencies)
+        work[key] = {
             "source_signature": source_signature,
-            "output": str(output.resolve()),
-            "interval_count": worker.value,
-            "output_bytes": output_bytes,
-            "free_space_bytes_before": free_before,
-            "free_space_bytes_after": free_after,
-            "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-            "completed_at_utc": utc_now(),
+            "source_bytes": source_bytes,
+            "outputs": outputs,
+            "temporary_root": temporary_root,
         }
-        save_stage_manifest(manifest_path, manifest)
-        progress.set_postfix_str(
-            f"{bucket:04d} free={free_after / TIB:.2f}TiB"
+        tasks.append(
+            BucketTask(
+                key=key,
+                label=f"{bucket:04d}",
+                source_bytes=source_bytes,
+                estimated_output_bytes=track_path.stat().st_size,
+                call=IsolatedCall(
+                    key=key,
+                    target=_write_interval_bucket_worker,
+                    args=(
+                        config,
+                        track_path,
+                        candidates_path,
+                        context_path,
+                        calls_path,
+                        temporary_root,
+                    ),
+                ),
+            )
         )
 
-    output_root = config.storage.work_root / "outputs" / "trajectory_intervals"
-    export_signature = signature(
-        (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
-        for path in outputs
-    )
-    if force or not item_is_complete(
-        manifest, "yearly_export", stage_hash, export_signature, [output_root]
-    ):
-        estimated_output_bytes = total_file_size(outputs) * 2
-        free_before = ensure_storage_budget(
-            config,
-            "export yearly trajectory intervals",
-            estimated_output_bytes,
-        )
-        started = time.perf_counter()
-        worker = run_isolated(_export_yearly, config, outputs, output_root)
-        output_bytes = directory_size(output_root)
+    def complete(execution: BucketExecution) -> str:
+        item = work[execution.task.key]
+        temporary_root = item["temporary_root"]
+        for output in item["outputs"]:
+            year = output.parent.name
+            replace_file(temporary_root / year / "part.parquet", output)
+        output_bytes = sum(output.stat().st_size for output in item["outputs"])
+        remove_path(temporary_root, config.storage.work_root)
         free_after = free_space_bytes(config.storage.work_root)
-        manifest["items"]["yearly_export"] = {
+        elapsed = execution.result.elapsed_seconds
+        source_bytes = item["source_bytes"]
+        io_rate = (source_bytes + output_bytes) / 1024**2 / elapsed
+        manifest["items"][execution.task.key] = {
             "status": "complete",
             "config_hash": stage_hash,
-            "source_signature": export_signature,
-            "output": str(output_root.resolve()),
-            "interval_count": worker.value,
+            "source_signature": item["source_signature"],
+            "outputs": [str(path.resolve()) for path in item["outputs"]],
+            "interval_count": execution.result.value["interval_count"],
+            "year_counts": execution.result.value["year_counts"],
+            "source_bytes": source_bytes,
             "output_bytes": output_bytes,
-            "free_space_bytes_before": free_before,
+            "io_mib_per_second": round(io_rate, 2),
+            "free_space_bytes_before": execution.free_space_bytes_before,
             "free_space_bytes_after": free_after,
-            "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "worker_process_id": execution.result.process_id,
+            "elapsed_seconds": round(elapsed, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        return f"{io_rate:.1f}MiB/s"
+
+    run_bucket_stage(
+        config,
+        "build state intervals",
+        tasks,
+        total_count=len(tracks),
+        completed_count=completed_count,
+        completed_samples=completed_samples,
+        on_complete=complete,
+    )
     return manifest

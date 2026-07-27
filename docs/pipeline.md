@@ -12,9 +12,11 @@ Every heavy work unit runs in a fresh spawned operating-system process and follo
 4. Atomically replace the final output.
 5. Record the Git commit, worker PID, row counts where practical, elapsed time and completion timestamp.
 
-An interrupted active unit restarts; completed units are skipped. Process exit is the resource boundary: it releases DuckDB native allocator state, caches, threads and handles that closing a connection alone may retain in a long-lived Python process. Only one heavy worker runs at a time. Stage 01 uses one worker per source day; later boundaries are one month, static compaction, one MMSI bucket, the port catalog, annual export, or the validation report as appropriate.
+An interrupted active unit restarts; completed units are skipped. Process exit is the resource boundary: it releases DuckDB native allocator state, caches, threads and handles that closing a connection alone may retain in a long-lived Python process. Global units use one worker with the global thread/memory profile. MMSI-bucket units use at most two concurrent spawned workers on the production HDD, each with its own bounded thread, memory and temporary-directory profile.
 
-Before every incomplete work unit, the storage guard requires free bytes to cover both the configured minimum reserve and a conservative estimate of the active unit's output. DuckDB's temporary-directory limit is set from the remaining budget, so external sorts cannot consume the reserved output and safety space. Manifests record free bytes before and after each newly completed unit.
+Before every incomplete work unit, the storage guard requires free bytes to cover the configured minimum reserve and a conservative estimate of the active output. Bucket scheduling also reserves every worker's maximum DuckDB temporary budget before launching another process. Manifests record source/output bytes, effective throughput and free bytes before and after each newly completed unit.
+
+DuckDB's internal operator progress is disabled because it does not account reliably for blocking finalization and Parquet flushes. Parent progress bars derive ETA only from the full elapsed time of completed compatible units. They show `ETA calibrating` before a real sample exists and reduce assumed parallelism when fewer buckets remain.
 
 ## Data stages
 
@@ -38,13 +40,13 @@ A stop candidate is a low-speed point or a point with missing speed and a suffic
 
 WPI rows with invalid coordinates or an excluded Harbor Size are removed. Port centers separated by no more than `group_distance_km` are unioned through connected components. Every member remains in `port_catalog`; recognition outputs the shared `port_group_id`.
 
-Stop centroids are aggregated on the anchor grid. Cells must meet minimum stop-event and distinct-vessel support. Each qualified cell is assigned to the nearest WPI member within `anchor_assignment_radius_km`. The assigned cells become multi-circle anchor centers. Stops within the entry radius of an anchor form independent port-call evidence.
+Stop centroids are aggregated on the anchor grid. Cells must meet minimum stop-event and distinct-vessel support. Each qualified cell is assigned to the nearest WPI member within `anchor_assignment_radius_km`. The assigned cells become multi-circle anchor centers. Stops within the entry radius of an anchor form independent port-call evidence. This stop-to-port matching is written and resumed per MMSI bucket rather than materialized as one global table.
 
 A 0.1-degree lookup table maps AIS `geo_tile` values to possible anchors. Exact Haversine distance is always applied after the coarse join.
 
 ### Stage 06: candidates and port calls
 
-For each near-port point, the minimum exact distance to every candidate port group is retained and ranked. Consecutive rank-one points for the same group form an approach episode; missing points, group changes and excessive point gaps split episodes.
+For each near-port point, the minimum exact distance to every candidate port group is retained and ranked. A compact one-row-per-point context stores the first and second candidate, both distances and the ambiguity margin so downstream queries do not repeat the rank-one/rank-two self-join. Consecutive rank-one points for the same group form an approach episode; missing points, group changes and excessive point gaps split episodes.
 
 An episode becomes a confirmed port call only when it:
 
@@ -54,7 +56,7 @@ An episode becomes a confirmed port call only when it:
 
 The candidate and port-call files preserve source labels, distance margins and evidence counts for audit. Source `at_dock` and port labels do not confirm a call, so they remain independent comparison evidence.
 
-### Stage 07: states and annual intervals
+### Final states and annual intervals
 
 Each valid track point is attached to its most recent and next confirmed port call using temporal ASOF joins. Classification precedence is:
 
@@ -63,7 +65,7 @@ Each valid track point is attached to its most recent and next confirmed port ca
 3. Within the approach radius of the next call: `ARRIVING`.
 4. Otherwise: `OCEAN`.
 
-If previous and next approach zones both contain the point, the nearer group determines the direction. Consecutive equal state/from/to points are compressed. Gaps above the configured threshold are emitted separately as `UNKNOWN_GAP`. Segments crossing January 1 are clipped into separate annual rows.
+If previous and next approach zones both contain the point, the nearer group determines the direction. Consecutive equal state/from/to points are compressed. Gaps above the configured threshold are emitted separately as `UNKNOWN_GAP`. Segments crossing January 1 are clipped into separate annual rows. Each bucket worker writes its annual files directly to `outputs/trajectory_intervals/year=YYYY`; there is no duplicate global annual-export scan or persistent stage-07 copy.
 
 The output intentionally excludes endpoint coordinates, duration and route distance.
 

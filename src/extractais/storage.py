@@ -56,6 +56,34 @@ def ensure_storage_budget(
     return free_bytes
 
 
+def ensure_parallel_storage_budget(
+    config: AppConfig,
+    operation: str,
+    active_output_bytes: int,
+    next_output_bytes: int,
+) -> int:
+    free_bytes = free_space_bytes(config.storage.work_root)
+    reserve_bytes = minimum_free_space_bytes(config)
+    temp_bytes = int(
+        config.runtime.bucket_workers
+        * config.runtime.bucket_temp_limit_gb
+        * GIB
+    )
+    output_bytes = max(0, int(active_output_bytes)) + max(
+        0, int(next_output_bytes)
+    )
+    required_bytes = reserve_bytes + temp_bytes + output_bytes
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            f"Storage guard stopped before {operation}: "
+            f"{free_bytes / GIB:.1f} GiB available, "
+            f"{reserve_bytes / GIB:.1f} GiB reserved, "
+            f"{temp_bytes / GIB:.1f} GiB reserved for concurrent DuckDB temp, "
+            f"{output_bytes / GIB:.1f} GiB estimated for active outputs"
+        )
+    return free_bytes
+
+
 def duckdb_temp_budget_bytes(
     config: AppConfig,
     output_reserve_bytes: int = 0,

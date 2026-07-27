@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import duckdb
 
 from extractais.config import AppConfig
-from extractais.storage import duckdb_temp_budget_bytes
+from extractais.storage import GIB, duckdb_temp_budget_bytes
 
 
 def sql_literal(value: str) -> str:
@@ -15,14 +16,33 @@ def sql_literal(value: str) -> str:
 def open_database(
     config: AppConfig,
     output_reserve_bytes: int = 0,
+    workload: str = "global",
 ) -> duckdb.DuckDBPyConnection:
-    config.storage.temp_directory.mkdir(parents=True, exist_ok=True)
+    if workload not in {"global", "bucket"}:
+        raise ValueError(f"Unknown DuckDB workload profile: {workload}")
+    threads = (
+        config.runtime.bucket_threads
+        if workload == "bucket"
+        else config.runtime.threads
+    )
+    memory_limit = (
+        config.runtime.bucket_memory_limit
+        if workload == "bucket"
+        else config.runtime.memory_limit
+    )
+    worker_temp = config.storage.temp_directory / f"worker-{os.getpid()}"
+    worker_temp.mkdir(parents=True, exist_ok=True)
     temp_budget_bytes = duckdb_temp_budget_bytes(config, output_reserve_bytes)
+    if workload == "bucket":
+        temp_budget_bytes = min(
+            temp_budget_bytes,
+            int(config.runtime.bucket_temp_limit_gb * GIB),
+        )
     connection = duckdb.connect(database=":memory:")
-    connection.execute(f"SET threads = {config.runtime.threads}")
-    connection.execute(f"SET memory_limit = {sql_literal(config.runtime.memory_limit)}")
+    connection.execute(f"SET threads = {threads}")
+    connection.execute(f"SET memory_limit = {sql_literal(memory_limit)}")
     connection.execute(
-        f"SET temp_directory = {sql_literal(str(config.storage.temp_directory.resolve()))}"
+        f"SET temp_directory = {sql_literal(str(worker_temp.resolve()))}"
     )
     connection.execute(
         f"SET max_temp_directory_size = {sql_literal(f'{temp_budget_bytes}B')}"
@@ -32,13 +52,9 @@ def open_database(
         f"{config.prepare.partition_write_max_open_files}"
     )
     connection.execute("SET preserve_insertion_order = false")
-    if config.runtime.enable_progress:
-        connection.execute("PRAGMA enable_progress_bar")
-        connection.execute(
-            f"SET progress_bar_time = {config.runtime.progress_bar_time_ms}"
-        )
-    else:
-        connection.execute("PRAGMA disable_progress_bar")
+    # DuckDB's operator ETA omits blocking finalization and buffered flushes.
+    # The parent process reports ETA from completed work-unit throughput instead.
+    connection.execute("PRAGMA disable_progress_bar")
     return connection
 
 

@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Dict
 
-from tqdm import tqdm
-
+from extractais.bucketstage import BucketExecution, BucketTask, run_bucket_stage
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql
 from extractais.fileutils import replace_file, temporary_file
 from extractais.gitmeta import git_commit
-from extractais.isolated import run_isolated
+from extractais.isolated import IsolatedCall
 from extractais.sql import haversine_km, parquet_sources
 from extractais.stage import (
     item_is_complete,
@@ -19,11 +17,7 @@ from extractais.stage import (
     signature,
     utc_now,
 )
-from extractais.storage import (
-    TIB,
-    ensure_storage_budget,
-    free_space_bytes,
-)
+from extractais.storage import free_space_bytes
 
 
 def track_bucket_files(config: AppConfig) -> list[Path]:
@@ -44,7 +38,8 @@ def _write_stop_bucket(config: AppConfig, source_path: Path, output: Path) -> in
     select_sql = f"""
         WITH candidates AS (
             SELECT
-                *,
+                mmsi, point_seq, timestamp_utc, latitude, longitude, speed,
+                source_at_dock, gap_seconds, step_distance_km,
                 (
                     coalesce(speed <= {config.stops.max_speed_knots}, false)
                     OR (speed IS NULL AND coalesce(step_distance_km <= {config.stops.max_step_km}, false))
@@ -124,6 +119,7 @@ def _write_stop_bucket(config: AppConfig, source_path: Path, output: Path) -> in
     connection = open_database(
         config,
         output_reserve_bytes=source_path.stat().st_size,
+        workload="bucket",
     )
     try:
         result = connection.execute(
@@ -154,13 +150,11 @@ def build_stops(
     manifest["config_hash"] = stage_hash
     manifest["git_commit"] = git_commit(project_root)
 
-    progress = tqdm(
-        sources,
-        desc="detect stop events",
-        disable=not config.runtime.enable_progress,
-        dynamic_ncols=True,
-    )
-    for source_path in progress:
+    tasks: list[BucketTask] = []
+    work: Dict[str, Dict[str, Any]] = {}
+    completed_samples: list[tuple[int, float]] = []
+    completed_count = 0
+    for source_path in sources:
         bucket = bucket_number(source_path)
         source_signature = signature(
             [(str(source_path.resolve()), source_path.stat().st_size, source_path.stat().st_mtime_ns)]
@@ -175,36 +169,69 @@ def build_stops(
         if not force and item_is_complete(
             manifest, key, stage_hash, source_signature, [output]
         ):
+            completed_count += 1
+            item = manifest["items"][key]
+            completed_samples.append(
+                (
+                    int(item.get("source_bytes", source_path.stat().st_size)),
+                    float(item.get("elapsed_seconds", 0)),
+                )
+            )
             continue
         source_bytes = source_path.stat().st_size
-        free_before = ensure_storage_budget(
-            config,
-            f"detect stops in MMSI bucket {bucket:04d}",
-            source_bytes,
+        work[key] = {
+            "bucket": bucket,
+            "source_signature": source_signature,
+            "source_bytes": source_bytes,
+            "output": output,
+        }
+        tasks.append(
+            BucketTask(
+                key=key,
+                label=f"{bucket:04d}",
+                source_bytes=source_bytes,
+                estimated_output_bytes=source_bytes,
+                call=IsolatedCall(
+                    key=key,
+                    target=_write_stop_bucket,
+                    args=(config, source_path, output),
+                ),
+            )
         )
-        progress.set_postfix_str(
-            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
-        )
-        started = time.perf_counter()
-        worker = run_isolated(
-            _write_stop_bucket, config, source_path, output
-        )
-        stop_count = worker.value
+
+    def complete(execution: BucketExecution) -> str:
+        item = work[execution.task.key]
+        output = item["output"]
         free_after = free_space_bytes(config.storage.work_root)
-        manifest["items"][key] = {
+        output_bytes = output.stat().st_size
+        source_bytes = item["source_bytes"]
+        elapsed = execution.result.elapsed_seconds
+        io_rate = (source_bytes + output_bytes) / 1024**2 / elapsed
+        manifest["items"][execution.task.key] = {
             "status": "complete",
             "config_hash": stage_hash,
-            "source_signature": source_signature,
+            "source_signature": item["source_signature"],
             "output": str(output.resolve()),
-            "stop_count": stop_count,
-            "free_space_bytes_before": free_before,
+            "stop_count": execution.result.value,
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "io_mib_per_second": round(io_rate, 2),
+            "free_space_bytes_before": execution.free_space_bytes_before,
             "free_space_bytes_after": free_after,
-            "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "worker_process_id": execution.result.process_id,
+            "elapsed_seconds": round(elapsed, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
-        progress.set_postfix_str(
-            f"{bucket:04d} free={free_after / TIB:.2f}TiB"
-        )
+        return f"{io_rate:.1f}MiB/s"
+
+    run_bucket_stage(
+        config,
+        "detect stop events",
+        tasks,
+        total_count=len(sources),
+        completed_count=completed_count,
+        completed_samples=completed_samples,
+        on_complete=complete,
+    )
     return manifest

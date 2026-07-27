@@ -37,8 +37,11 @@ storage:
 runtime:
   threads: 2
   memory_limit: "1GB"
+  bucket_workers: 2
+  bucket_threads: 1
+  bucket_memory_limit: "384MB"
+  bucket_temp_limit_gb: 1
   enable_progress: false
-  progress_bar_time_ms: 1000
   minimum_free_space_gb: 0
 split:
   dynamic_message_types: [1, 2, 3, 18, 19, 27]
@@ -167,6 +170,17 @@ def test_complete_pipeline_builds_port_calls_states_and_validation(tmp_path: Pat
         str(work_root / "stage06_port_calls" / "mmsi_bucket=*" / "port_calls.parquet")
     ).fetchall()
     assert len(calls) == 2
+    assert list(
+        (work_root / "stage05_ports" / "stop_port_matches").glob(
+            "mmsi_bucket=*/part.parquet"
+        )
+    )
+    assert list(
+        (work_root / "stage06_port_calls").glob(
+            "mmsi_bucket=*/port_context.parquet"
+        )
+    )
+    assert not (work_root / "stage07_intervals").exists()
 
     interval_glob = str(
         work_root / "outputs" / "trajectory_intervals" / "year=2021" / "*.parquet"
@@ -208,11 +222,19 @@ def test_complete_pipeline_builds_port_calls_states_and_validation(tmp_path: Pat
         assert os.getpid() not in worker_process_ids
 
     interval_file = next(
-        (work_root / "stage07_intervals").glob("mmsi_bucket=*/part.parquet")
+        (work_root / "outputs" / "trajectory_intervals").glob(
+            "year=*/mmsi_bucket=*.parquet"
+        )
     )
     modified_time = interval_file.stat().st_mtime_ns
     build_intervals(config, tmp_path)
     assert interval_file.stat().st_mtime_ns == modified_time
+    interval_manifest = json.loads(
+        (work_root / "manifests" / "intervals.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "yearly_export" not in interval_manifest["items"]
 
 
 def test_stop_stage_can_commit_an_empty_bucket(tmp_path: Path) -> None:
@@ -295,6 +317,24 @@ def test_missing_space_reserve_defaults_to_500_gib(
     assert config.runtime.minimum_free_space_gb == 500
 
 
+def test_legacy_runtime_config_gets_resource_defaults(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    config_path = _pipeline_config(tmp_path, raw_root, tmp_path / "work")
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        .replace("  threads: 2\n", "")
+        .replace('  memory_limit: "1GB"\n', ""),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.runtime.threads == 20
+    assert config.runtime.memory_limit == "90GB"
+
+
 def test_production_example_uses_bounded_partition_writers() -> None:
     project_root = Path(__file__).parents[1]
     config = load_config(project_root / "configs" / "production.example.yaml")
@@ -303,6 +343,10 @@ def test_production_example_uses_bounded_partition_writers() -> None:
     assert config.prepare.partition_write_max_open_files == 100
     assert config.prepare.row_group_size == 250_000
     assert config.runtime.minimum_free_space_gb == 500
+    assert config.runtime.bucket_workers == 2
+    assert config.runtime.bucket_threads == 10
+    assert config.runtime.bucket_memory_limit == "42GB"
+    assert config.runtime.bucket_temp_limit_gb == 256
 
 
 def test_duckdb_partition_writer_limits_open_files_independently_of_buckets(
@@ -325,6 +369,31 @@ def test_duckdb_partition_writer_limits_open_files_independently_of_buckets(
 
     assert maximum_open_files == config.prepare.partition_write_max_open_files
     assert maximum_open_files < config.prepare.mmsi_buckets
+
+
+def test_bucket_database_uses_bounded_resources_and_no_internal_eta(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    config = load_config(_pipeline_config(tmp_path, raw_root, tmp_path / "work"))
+
+    connection = open_database(config, workload="bucket")
+    try:
+        threads = int(
+            connection.execute("SELECT current_setting('threads')").fetchone()[0]
+        )
+        progress_enabled = bool(
+            connection.execute(
+                "SELECT current_setting('enable_progress_bar')"
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+
+    assert threads == config.runtime.bucket_threads
+    assert progress_enabled is False
 
 
 def test_diagnostic_classifies_partition_writer_fanout() -> None:
