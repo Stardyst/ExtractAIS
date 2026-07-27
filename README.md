@@ -267,6 +267,19 @@ extractais --config configs/production.yaml validate
 
 当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%。据此估计完整 `split` 约 1.03 TiB，完整流程峰值约 3.05 TiB；4.43 TiB 可用空间能够容纳，并保留约 1 TiB 余量。
 
+### 诊断 prepare 性能
+
+在 `prepare` 正在执行耗时查询时，另开一个已激活 `extractais` 环境的 PowerShell 窗口运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/diagnose_prepare.ps1 `
+  -Config configs/production.yaml `
+  -DurationMinutes 5 `
+  -IntervalSeconds 5
+```
+
+脚本只读取配置、manifest、文件大小和 Windows CIM 性能计数器，不停止进程、不修改派生数据，也不创建报告文件。它会识别当前月度分桶、静态压缩或 MMSI 桶排序任务，并输出进程 CPU/内存/句柄、物理盘吞吐和队列、DuckDB 临时目录增长、分区文件数量及瓶颈判断。诊断时应保留控制台中的 `Summary` 和 `Findings`。
+
 检查工作盘剩余空间：
 
 ```powershell
