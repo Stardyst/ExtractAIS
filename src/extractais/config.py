@@ -46,7 +46,7 @@ class SplitConfig:
 @dataclass(frozen=True)
 class PrepareConfig:
     mmsi_buckets: int = 256
-    partition_write_max_open_files: int = 100
+    partition_write_max_open_files: int = 256
     compression: str = "zstd"
     row_group_size: int = 250_000
     max_implied_speed_knots: float = 80.0
@@ -170,7 +170,7 @@ def load_config(path: Path) -> AppConfig:
         prepare=PrepareConfig(
             mmsi_buckets=int(prepare_raw.get("mmsi_buckets", 256)),
             partition_write_max_open_files=int(
-                prepare_raw.get("partition_write_max_open_files", 100)
+                prepare_raw.get("partition_write_max_open_files", 256)
             ),
             compression=str(prepare_raw.get("compression", "zstd")).lower(),
             row_group_size=int(prepare_raw.get("row_group_size", 250_000)),
@@ -234,11 +234,11 @@ def _validate_config(config: AppConfig) -> None:
         )
     if (
         config.prepare.partition_write_max_open_files
-        > config.prepare.mmsi_buckets
+        < config.prepare.mmsi_buckets
     ):
         raise ValueError(
-            "prepare.partition_write_max_open_files cannot exceed "
-            "prepare.mmsi_buckets"
+            "prepare.partition_write_max_open_files must be at least "
+            "prepare.mmsi_buckets to prevent partition file multiplication"
         )
     if not (
         0 < config.ports.entry_radius_km

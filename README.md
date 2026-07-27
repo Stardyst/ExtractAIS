@@ -22,7 +22,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-当前版本应显示 `1.4.0`。
+当前版本应显示 `1.4.1`。
 
 ## 2. 准备生产配置
 
@@ -62,6 +62,16 @@ runtime:
 ```
 
 月度分区、静态表、全局港口锚点和验证报告使用全局档位；MMSI 分桶排序、停留、停留到港口匹配、港口调用和区间构建使用两个并发桶工人。单 HDD 不建议继续增加 `bucket_workers`，否则随机读写和磁头寻道通常会抵消并行收益。旧配置缺少上述资源字段时会采用这里的默认值，`status` 不再因缺少 `threads` 报错。
+
+生产配置还必须为每个 MMSI 桶保留一个月度分区写入器：
+
+```yaml
+prepare:
+  mmsi_buckets: 256
+  partition_write_max_open_files: 256
+```
+
+`partition_write_max_open_files` 小于 `mmsi_buckets` 会让 DuckDB 反复关闭并重建分区文件，生产月份可膨胀到上万个小文件，因此新版会直接拒绝这种配置。
 
 ## 3. 先检查输入
 
@@ -156,7 +166,7 @@ python -c "import extractais; print(extractais.__version__)"
 extractais --config configs/production.yaml status
 ```
 
-版本应为 `1.4.0`。不需要删除 `derived`，也不要加 `--force`。旧 `configs/production.yaml` 即使缺少新资源字段也能加载；建议按第 2 节补齐字段，让实际资源配置可审计。
+版本应为 `1.4.1`。不需要删除 `derived`，也不要加 `--force`。旧 `configs/production.yaml` 即使缺少新资源字段也能加载；建议按第 2 节补齐字段，让实际资源配置可审计。若配置中仍是 `partition_write_max_open_files: 100`，必须先改为 `256`。
 
 当前是在 `prepare` 中途暂停时，继续执行：
 
@@ -269,9 +279,10 @@ extractais --config configs/production.yaml validate
 - `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
 - 恢复时总进度从已完成文件的真实字节数开始，跳过旧日期不会再产生虚假的 TB/s 瞬时速度。
 - 每个重型工作单元由独立子进程执行，修复了长时间运行中 DuckDB 连接虽然关闭、但同一 Python 进程的原生分配器和缓存仍持续累积而导致的吞吐衰减。
-- `prepare` 使用 256 个 MMSI 桶，使当前实测月度输入平均每桶约 119 MiB；同时打开的分区文件独立限制为 100，避免 HDD 同时维护全部 Parquet 写入流和大 row-group 缓冲。
+- `prepare` 使用 256 个 MMSI 桶，使当前实测月度输入平均每桶约 119 MiB；月度分区同时保持 256 个写入器，使每个非空桶只生成一个 Parquet 文件。
 - 生产 `row_group_size` 为 250000，降低分区写入峰值内存，并为后续单桶并行扫描保留足够的 row group。
-- 在同一份 1000 万行合成输入上，旧参数 `512/512/1000000` 的月分区写入耗时约 9.93 秒，新参数 `256/100/250000` 约 7.36 秒；新配置生成 536 个文件，而测试过的 64 文件上限会生成 831 个文件，因此未采用 64。
+- 在同一份 1000 万行、256 桶合成输入上，`partition_write_max_open_files=100` 用时 13.99 秒并生成 5120 个文件；设置为 256 后用时 8.03 秒且只生成 256 个文件。生产诊断中观察到的 17754 个文件正是相同的写入器轮换问题。
+- 第一个月尚未提交时，进度条每 30 秒更新临时输出 GiB 和文件数。月度提交前还会强制检查文件数不得超过 MMSI 桶数。
 - DuckDB 内部进度条已关闭，因为其算子百分比不包含阻塞算子的收尾、Parquet flush 和文件替换，曾把剩余时间低估到实际值的约四分之一。
 - 主进度条只使用已经完整提交的相同工作单元计算 ETA。没有实测样本时显示 `ETA calibrating`；随后采用最近 12 个单元的中位吞吐率，并在尾部按实际剩余工人数修正。该 ETA 包含完整查询和输出收尾时间，不使用当前 DuckDB 算子百分比。
 - 桶阶段显示两个活动桶、已提交桶数、实测 MiB/s、ETA 和剩余 TiB。`prepare` 排序、`stops`、停留匹配、`calls`、`intervals` 均使用相同调度器。

@@ -28,8 +28,9 @@ from extractais.stage import (
     utc_now,
 )
 from extractais.storage import (
+    GIB,
     TIB,
-    directory_size,
+    directory_stats,
     ensure_storage_budget,
     ensure_parallel_storage_budget,
     free_space_bytes,
@@ -317,10 +318,24 @@ def prepare_data(
         temporary = temporary_directory(output)
         remove_path(temporary, config.storage.work_root)
         temporary.parent.mkdir(parents=True, exist_ok=True)
+        heartbeat_checked_at = 0.0
+        heartbeat_output_bytes = 0
+        heartbeat_file_count = 0
 
         def poll_month(active, unit=month, unit_started=started) -> None:
+            nonlocal heartbeat_checked_at
+            nonlocal heartbeat_output_bytes
+            nonlocal heartbeat_file_count
+            now = time.perf_counter()
+            if now - heartbeat_checked_at >= 30:
+                heartbeat_output_bytes, heartbeat_file_count = directory_stats(
+                    temporary
+                )
+                heartbeat_checked_at = now
             month_progress.set_postfix_str(
-                f"{unit} elapsed={format_duration(time.perf_counter() - unit_started)} "
+                f"{unit} elapsed={format_duration(now - unit_started)} "
+                f"out={heartbeat_output_bytes / GIB:.2f}GiB "
+                f"files={heartbeat_file_count} "
                 f"{month_estimator.format_eta(month_remaining_bytes)}"
             )
             month_progress.refresh()
@@ -332,7 +347,13 @@ def prepare_data(
             temporary,
             _on_poll=poll_month,
         )
-        output_bytes = directory_size(temporary)
+        output_bytes, output_file_count = directory_stats(temporary)
+        if output_file_count > config.prepare.mmsi_buckets:
+            raise RuntimeError(
+                f"Partition file multiplication detected for {month}: "
+                f"{output_file_count} files for "
+                f"{config.prepare.mmsi_buckets} MMSI buckets"
+            )
         replace_directory(temporary, output, config.storage.work_root)
         elapsed = time.perf_counter() - started
         free_after = free_space_bytes(config.storage.work_root)
@@ -346,6 +367,7 @@ def prepare_data(
             "output": str(output.resolve()),
             "source_bytes": source_bytes,
             "output_bytes": output_bytes,
+            "output_file_count": output_file_count,
             "row_count": worker.value,
             "io_mib_per_second": round(io_mib_per_second, 2),
             "free_space_bytes_before": free_before,

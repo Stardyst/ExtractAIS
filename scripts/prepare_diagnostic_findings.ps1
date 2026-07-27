@@ -28,10 +28,11 @@ function Get-PrepareDiagnosticFindings {
     if ($Summary.MinimumAvailableMemoryGiB -lt 10) {
         $findings.Add("Memory pressure detected: system available memory fell below 10 GiB.")
     }
-    if ($Phase -eq "partition_month" -and $Summary.OutputFilesAtEnd -gt ($MmsiBuckets * 2)) {
-        $findings.Add("Partition file multiplication detected: output file count exceeds twice the configured bucket count.")
+    $isPartitionPhase = $Phase -eq "partition_month" -or $Phase -eq "prepare"
+    if ($isPartitionPhase -and $Summary.OutputFilesAtEnd -gt $MmsiBuckets) {
+        $findings.Add("Partition file multiplication detected: output file count exceeds the configured bucket count.")
     }
-    if ($Phase -eq "partition_month" -and
+    if ($isPartitionPhase -and
         $Summary.AverageCpuCores -lt 2 -and
         $Summary.OutputFilesAtEnd -ge $MmsiBuckets -and
         $Summary.PeakPrivateGiB -ge 32 -and

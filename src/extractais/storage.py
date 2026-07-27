@@ -21,11 +21,23 @@ def total_file_size(paths: Iterable[Path]) -> int:
 
 
 def directory_size(path: Path) -> int:
+    return directory_stats(path)[0]
+
+
+def directory_stats(path: Path) -> tuple[int, int]:
     if not path.exists():
-        return 0
-    return total_file_size(
-        candidate for candidate in path.rglob("*") if candidate.is_file()
-    )
+        return 0, 0
+    total_bytes = 0
+    file_count = 0
+    for candidate in path.rglob("*"):
+        if candidate.is_file():
+            try:
+                total_bytes += candidate.stat().st_size
+                file_count += 1
+            except OSError:
+                # Active writers may replace a file between enumeration and stat.
+                continue
+    return total_bytes, file_count
 
 
 def free_space_bytes(path: Path) -> int:

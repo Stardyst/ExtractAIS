@@ -33,9 +33,9 @@ prepare:
   # each full-archive bucket manageable on a 128 GiB host.
   # Do not change this after prepare has started.
   mmsi_buckets: 256
-  # Limit concurrent partition writers on the HDD; this is intentionally
-  # independent from mmsi_buckets.
-  partition_write_max_open_files: 100
+  # Keep one writer open per bucket. A lower value repeatedly closes writers
+  # and creates thousands of small Parquet files on production-scale months.
+  partition_write_max_open_files: 256
   compression: "zstd"
   row_group_size: 250000
   max_implied_speed_knots: 80

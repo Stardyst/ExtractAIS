@@ -50,7 +50,7 @@ split:
   row_group_size: 10000
 prepare:
   mmsi_buckets: 2
-  partition_write_max_open_files: 1
+  partition_write_max_open_files: 2
   compression: "zstd"
   row_group_size: 10000
   max_implied_speed_knots: 1000
@@ -160,6 +160,12 @@ def test_complete_pipeline_builds_port_calls_states_and_validation(tmp_path: Pat
     inventory = discover_files(config)
     split_files(config, inventory.files, tmp_path)
     prepare_data(config, tmp_path)
+    month_files = list(
+        (work_root / "stage02_partitioned" / "year=2021" / "month=01").rglob(
+            "*.parquet"
+        )
+    )
+    assert len(month_files) <= config.prepare.mmsi_buckets
     build_stops(config, tmp_path)
     build_ports(config, tmp_path)
     build_port_calls(config, tmp_path)
@@ -340,7 +346,7 @@ def test_production_example_uses_bounded_partition_writers() -> None:
     config = load_config(project_root / "configs" / "production.example.yaml")
 
     assert config.prepare.mmsi_buckets == 256
-    assert config.prepare.partition_write_max_open_files == 100
+    assert config.prepare.partition_write_max_open_files == 256
     assert config.prepare.row_group_size == 250_000
     assert config.runtime.minimum_free_space_gb == 500
     assert config.runtime.bucket_workers == 2
@@ -349,7 +355,26 @@ def test_production_example_uses_bounded_partition_writers() -> None:
     assert config.runtime.bucket_temp_limit_gb == 256
 
 
-def test_duckdb_partition_writer_limits_open_files_independently_of_buckets(
+def test_partition_writer_rejects_fewer_open_files_than_buckets(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    config_path = _pipeline_config(tmp_path, raw_root, tmp_path / "work")
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "partition_write_max_open_files: 2",
+            "partition_write_max_open_files: 1",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="at least prepare.mmsi_buckets"):
+        load_config(config_path)
+
+
+def test_duckdb_keeps_one_partition_writer_per_bucket(
     tmp_path: Path,
 ) -> None:
     raw_root = tmp_path / "raw"
@@ -368,7 +393,7 @@ def test_duckdb_partition_writer_limits_open_files_independently_of_buckets(
         connection.close()
 
     assert maximum_open_files == config.prepare.partition_write_max_open_files
-    assert maximum_open_files < config.prepare.mmsi_buckets
+    assert maximum_open_files >= config.prepare.mmsi_buckets
 
 
 def test_bucket_database_uses_bounded_resources_and_no_internal_eta(
@@ -396,7 +421,7 @@ def test_bucket_database_uses_bounded_resources_and_no_internal_eta(
     assert progress_enabled is False
 
 
-def test_diagnostic_classifies_partition_writer_fanout() -> None:
+def test_diagnostic_classifies_file_multiplication_in_prepare() -> None:
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell is required for the diagnostic script test")
@@ -405,24 +430,24 @@ def test_diagnostic_classifies_partition_writer_fanout() -> None:
     command = f"""
 . '{helper.as_posix()}'
 $summary = [pscustomobject]@{{
-    AverageCpuPercent = 3.77
-    AverageCpuCores = 1.21
-    PeakPrivateGiB = 63.56
-    MinimumAvailableMemoryGiB = 40.30
-    PeakHandles = 1036
-    AverageProcessReadMiBps = 48.71
-    AverageProcessWriteMiBps = 64.59
+    AverageCpuPercent = 3.89
+    AverageCpuCores = 1.25
+    PeakPrivateGiB = 5.89
+    MinimumAvailableMemoryGiB = 99.25
+    PeakHandles = 603
+    AverageProcessReadMiBps = 0
+    AverageProcessWriteMiBps = 6.21
     AverageDiskReadMiBps = 0
-    AverageDiskWriteMiBps = 41.09
-    AverageDiskBusyPercent = 64.78
-    AverageDiskQueue = 0.53
-    PeakDiskQueue = 18
-    OutputGrowthGiB = 0
-    OutputFilesAtEnd = 512
-    TempGrowthGiB = 0.07
-    FreeSpaceChangeGiB = -8.29
+    AverageDiskWriteMiBps = 6.16
+    AverageDiskBusyPercent = 7.29
+    AverageDiskQueue = 0
+    PeakDiskQueue = 0
+    OutputGrowthGiB = 0.82
+    OutputFilesAtEnd = 17754
+    TempGrowthGiB = 0
+    FreeSpaceChangeGiB = -0.85
 }}
-$findings = @(Get-PrepareDiagnosticFindings -Summary $summary -Phase 'partition_month' -MmsiBuckets 512)
+$findings = @(Get-PrepareDiagnosticFindings -Summary $summary -Phase 'prepare' -MmsiBuckets 256)
 ConvertTo-Json -InputObject $findings -Compress
 """
     result = subprocess.run(
@@ -433,4 +458,4 @@ ConvertTo-Json -InputObject $findings -Compress
     )
 
     findings = json.loads(result.stdout)
-    assert any("partition writer fan-out" in finding.lower() for finding in findings)
+    assert any("partition file multiplication" in finding.lower() for finding in findings)
