@@ -22,7 +22,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-当前版本应显示 `1.1.0`。
+当前版本应显示 `1.2.0`。
 
 ## 2. 准备生产配置
 
@@ -47,7 +47,7 @@ storage:
   temp_directory: "E:/AIS2021-2022/derived/tmp"
 ```
 
-`configs/production.yaml` 已由 `.gitignore` 排除。路径、线程数和内存限制可以按主机调整；生产主机的 128 GB 内存建议保持 `threads: 20`、`memory_limit: "100GB"`，为系统和文件缓存保留余量。`minimum_free_space_gb: 500` 表示工作盘不足 500 GiB 时，在读取下一天 CSV 前安全停止。
+`configs/production.yaml` 已由 `.gitignore` 排除。路径、线程数和内存限制可以按主机调整；生产主机的 128 GB 内存建议保持 `threads: 20`、`memory_limit: "100GB"`，为系统和文件缓存保留余量。`minimum_free_space_gb: 500` 表示每个工作单元开始前必须为工作盘保留 500 GiB，此外还必须容纳该单元的预计输出。该检查覆盖全部阶段，DuckDB 临时文件也受到同一预算限制。
 
 ## 3. 先检查输入
 
@@ -130,7 +130,7 @@ extractais --config configs/production.yaml run-all
 
 子进程隔离边界与恢复粒度一致：`split` 为每日文件，`prepare` 为月/静态表/MMSI 桶，`stops`、`calls` 和区间构建为 MMSI 桶，`ports`、年度导出和 `validate` 各为一个整体单元。任意时刻只运行一个重型子进程，不会因为隔离而并发占用多份 `memory_limit`。
 
-### 从 1.0.1 升级并继续现有 split
+### 从旧版本继续现有任务
 
 先停止旧进程，再在仓库根目录执行：
 
@@ -142,7 +142,15 @@ python -c "import extractais; print(extractais.__version__)"
 extractais --config configs/production.yaml split
 ```
 
-不需要删除 `derived`，也不要加 `--force`。原 manifest 中已经完成的日期会直接跳过；中断时正在处理且尚未提交的日期会重算。旧记录没有 `worker_process_id` 属于正常情况，新完成记录会写入该字段。
+不需要删除 `derived`，也不要加 `--force`。原 manifest 中已经完成的日期会直接跳过；中断时正在处理且尚未提交的日期会重算。旧记录没有新增审计字段属于正常情况，新完成记录会补充这些字段。
+
+正在运行旧版 `prepare` 时，停止旧进程并完成上述更新后执行：
+
+```powershell
+extractais --config configs/production.yaml prepare
+```
+
+版本应为 `1.2.0`。已经提交的月份会跳过，中断时正在处理的月份会重算。新完成月份会在 `manifests/prepare.json` 中记录输入/输出字节、行数、实际 MiB/s、执行前后剩余空间和子进程 PID。
 
 查看目前进度和最终路径：
 
@@ -248,10 +256,13 @@ extractais --config configs/production.yaml validate
 - `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
 - 恢复时总进度从已完成文件的真实字节数开始，跳过旧日期不会再产生虚假的 TB/s 瞬时速度。
 - 每个重型工作单元由独立子进程执行，修复了长时间运行中 DuckDB 连接虽然关闭、但同一 Python 进程的原生分配器和缓存仍持续累积而导致的吞吐衰减。
+- `prepare` 将 DuckDB 的分区文件上限设置为 `mmsi_buckets`。生产配置的 512 个桶可以同时保持打开，避免默认 100 个文件上限造成反复刷新；静态压缩和轨迹排序也不再为了计数额外扫描输入。
+- `prepare` 的月/桶进度显示该工作单元的实际压缩读写 MiB/s 和剩余 TiB；这比外层 `it/s` 更适合判断吞吐是否稳定。
 - 后续阶段按月或 MMSI 桶显示进度，单桶可以使用磁盘临时空间完成外部排序。
 - 动态分桶按月只扫描一次，不会为 512 个桶重复扫描全年数据。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。
 - `temp_directory` 必须和 `work_root` 位于容量充足的工作盘；不要指向系统盘。
+- 空间保护要求 `free >= minimum_free_space + estimated_output`。如果不满足，命令会在创建下一个临时输出前报 `Storage guard stopped`；当前已完成检查点不会受损。
 - 不要手工删除阶段目录后再执行 `run-all`。当前版本把中间产物视为可复现检查点，删除后会按依赖关系重建。
 
 当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%。据此估计完整 `split` 约 1.03 TiB，完整流程峰值约 3.05 TiB；4.43 TiB 可用空间能够容纳，并保留约 1 TiB 余量。

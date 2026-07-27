@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from extractais.calls import build_port_calls
 from extractais.config import load_config
+from extractais.database import open_database
 from extractais.intervals import build_intervals
 from extractais.inventory import discover_files
 from extractais.ports import build_ports
@@ -193,6 +195,11 @@ def test_complete_pipeline_builds_port_calls_states_and_validation(tmp_path: Pat
             item["worker_process_id"]
             for item in stage_manifest["items"].values()
         }
+        assert all(
+            item["free_space_bytes_before"] > 0
+            and item["free_space_bytes_after"] > 0
+            for item in stage_manifest["items"].values()
+        )
         assert worker_process_ids
         assert os.getpid() not in worker_process_ids
 
@@ -235,3 +242,53 @@ def test_stop_stage_can_commit_an_empty_bucket(tmp_path: Path) -> None:
 
     stop_file = next((work_root / "stage04_stops").glob("mmsi_bucket=*/part.parquet"))
     assert duckdb.read_parquet(str(stop_file)).fetchall() == []
+
+
+def test_prepare_stops_before_work_when_storage_budget_is_insufficient(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    year = raw_root / "2021"
+    year.mkdir(parents=True)
+    _write_ports(raw_root / "ports.csv")
+    _write_track(year / "2021-01-01.csv")
+    work_root = tmp_path / "work"
+    config_path = _pipeline_config(tmp_path, raw_root, work_root)
+    config = load_config(config_path)
+    inventory = discover_files(config)
+    split_files(config, inventory.files, tmp_path)
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "progress_bar_time_ms: 1000",
+            "progress_bar_time_ms: 1000\n  minimum_free_space_gb: 1000000",
+        ),
+        encoding="utf-8",
+    )
+    guarded_config = load_config(config_path)
+
+    with pytest.raises(RuntimeError, match="Storage guard stopped"):
+        prepare_data(guarded_config, tmp_path)
+
+    assert not (work_root / "stage02_partitioned").exists()
+
+
+def test_duckdb_partition_writer_can_keep_every_mmsi_bucket_open(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    config = load_config(_pipeline_config(tmp_path, raw_root, tmp_path / "work"))
+
+    connection = open_database(config)
+    try:
+        maximum_open_files = int(
+            connection.execute(
+                "SELECT current_setting('partitioned_write_max_open_files')"
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+
+    assert maximum_open_files == config.prepare.mmsi_buckets

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,10 +22,7 @@ from extractais.schema import (
     STATIC_SELECT,
     sql_int_list,
 )
-
-
-GIB = 1024**3
-TIB = 1024**4
+from extractais.storage import TIB, ensure_storage_budget, free_space_bytes
 
 
 def _output_paths(work_root: Path, item: InputFile) -> tuple[Path, Path]:
@@ -52,23 +48,6 @@ def _output_paths(work_root: Path, item: InputFile) -> tuple[Path, Path]:
     return dynamic, static
 
 
-def _free_space_bytes(config: AppConfig) -> int:
-    config.storage.work_root.mkdir(parents=True, exist_ok=True)
-    return int(shutil.disk_usage(config.storage.work_root).free)
-
-
-def _enforce_free_space(config: AppConfig, item: InputFile) -> int:
-    free_bytes = _free_space_bytes(config)
-    required_bytes = int(config.runtime.minimum_free_space_gb * GIB)
-    if required_bytes and free_bytes < required_bytes:
-        raise RuntimeError(
-            f"Free-space guard stopped before {item.date}: "
-            f"{free_bytes / GIB:.1f} GiB available, "
-            f"{config.runtime.minimum_free_space_gb:.1f} GiB required"
-        )
-    return free_bytes
-
-
 def _copy_count(connection, select_sql: str, output: Path, config: AppConfig) -> int:
     result = connection.execute(
         parquet_copy_sql(
@@ -87,7 +66,7 @@ def _process_day(
     dynamic_temp: Path,
     static_temp: Path,
 ) -> Dict[str, Any]:
-    connection = open_database(config)
+    connection = open_database(config, output_reserve_bytes=item.size_bytes)
     try:
         raw_sql = RAW_PROJECTION.format(input_path=sql_literal(item.path))
         connection.execute(
@@ -189,7 +168,11 @@ def split_files(
                 progress.set_postfix_str(f"skip {item.date}")
                 continue
 
-            free_before = _enforce_free_space(config, item)
+            free_before = ensure_storage_budget(
+                config,
+                item.date,
+                estimated_output_bytes=item.size_bytes,
+            )
             progress.set_postfix_str(
                 f"{item.date} free={free_before / TIB:.2f}TiB"
             )
@@ -216,7 +199,7 @@ def split_files(
                 compression_ratio = (
                     total_output_bytes / item.size_bytes if item.size_bytes else 0.0
                 )
-                free_after = _free_space_bytes(config)
+                free_after = free_space_bytes(config.storage.work_root)
                 elapsed = time.perf_counter() - started
                 manifest["files"][item.path] = {
                     "status": "complete",
@@ -231,6 +214,7 @@ def split_files(
                     "static_output_bytes": static_output_bytes,
                     "total_output_bytes": total_output_bytes,
                     "compression_ratio": round(compression_ratio, 6),
+                    "free_space_bytes_before": free_before,
                     "free_space_bytes_after": free_after,
                     "worker_process_id": worker.process_id,
                     "elapsed_seconds": round(elapsed, 3),

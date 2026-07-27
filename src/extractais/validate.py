@@ -19,6 +19,12 @@ from extractais.stage import (
     signature,
     utc_now,
 )
+from extractais.storage import (
+    GIB,
+    directory_size,
+    ensure_storage_budget,
+    free_space_bytes,
+)
 
 
 def _csv_copy(connection, select_sql: str, output: Path) -> None:
@@ -79,11 +85,20 @@ def _build_validation_in_process(
     ):
         return manifest
 
+    estimated_output_bytes = GIB
+    free_before = ensure_storage_budget(
+        config,
+        "build validation reports",
+        estimated_output_bytes,
+    )
     started = time.perf_counter()
     temporary = temporary_directory(output_root)
     remove_path(temporary, config.storage.work_root)
     temporary.mkdir(parents=True, exist_ok=True)
-    connection = open_database(config)
+    connection = open_database(
+        config,
+        output_reserve_bytes=estimated_output_bytes,
+    )
     try:
         calls_source = parquet_sources(calls)
         candidates_source = parquet_sources(candidates)
@@ -233,12 +248,17 @@ def _build_validation_in_process(
         write_json_atomic(temporary / "summary.json", summary)
     finally:
         connection.close()
+    output_bytes = directory_size(temporary)
     replace_directory(temporary, output_root, config.storage.work_root)
+    free_after = free_space_bytes(config.storage.work_root)
     manifest["items"]["reports"] = {
         "status": "complete",
         "config_hash": stage_hash,
         "source_signature": source_signature,
         "output": str(output_root.resolve()),
+        "output_bytes": output_bytes,
+        "free_space_bytes_before": free_before,
+        "free_space_bytes_after": free_after,
         "worker_process_id": os.getpid(),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "completed_at_utc": utc_now(),

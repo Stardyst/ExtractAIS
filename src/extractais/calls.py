@@ -23,6 +23,12 @@ from extractais.stage import (
     signature,
     utc_now,
 )
+from extractais.storage import (
+    TIB,
+    directory_size,
+    ensure_storage_budget,
+    free_space_bytes,
+)
 from extractais.stops import bucket_number, track_bucket_files
 
 
@@ -198,7 +204,10 @@ def _write_port_call_bucket(
 ) -> Dict[str, int]:
     temporary_candidates = temporary_root / "candidates.parquet"
     temporary_calls = temporary_root / "port_calls.parquet"
-    connection = open_database(config)
+    connection = open_database(
+        config,
+        output_reserve_bytes=track_path.stat().st_size * 4,
+    )
     try:
         candidate_count = _write_candidates(
             connection,
@@ -268,6 +277,15 @@ def build_port_calls(
         ):
             continue
 
+        estimated_output_bytes = track_path.stat().st_size * 4
+        free_before = ensure_storage_budget(
+            config,
+            f"recognize calls in MMSI bucket {bucket:04d}",
+            estimated_output_bytes,
+        )
+        progress.set_postfix_str(
+            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
+        )
         started = time.perf_counter()
         temporary_root = temporary_directory(bucket_root)
         remove_path(temporary_root, config.storage.work_root)
@@ -279,7 +297,9 @@ def build_port_calls(
             temporary_root,
         )
         counts = worker.value
+        output_bytes = directory_size(temporary_root)
         replace_directory(temporary_root, bucket_root, config.storage.work_root)
+        free_after = free_space_bytes(config.storage.work_root)
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
@@ -287,9 +307,15 @@ def build_port_calls(
             "output": str(bucket_root.resolve()),
             "candidate_count": counts["candidate_count"],
             "port_call_count": counts["port_call_count"],
+            "output_bytes": output_bytes,
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        progress.set_postfix_str(
+            f"{bucket:04d} free={free_after / TIB:.2f}TiB"
+        )
     return manifest

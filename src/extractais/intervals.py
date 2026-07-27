@@ -25,6 +25,13 @@ from extractais.stage import (
     signature,
     utc_now,
 )
+from extractais.storage import (
+    TIB,
+    directory_size,
+    ensure_storage_budget,
+    free_space_bytes,
+    total_file_size,
+)
 from extractais.stops import bucket_number, track_bucket_files
 
 
@@ -289,7 +296,10 @@ def _write_interval_bucket_worker(
     calls_path: Path,
     output: Path,
 ) -> int:
-    connection = open_database(config)
+    connection = open_database(
+        config,
+        output_reserve_bytes=track_path.stat().st_size,
+    )
     try:
         return _write_interval_bucket(
             connection,
@@ -308,7 +318,10 @@ def _export_yearly(config: AppConfig, sources: list[Path], output_root: Path) ->
     remove_path(temporary, config.storage.work_root)
     temporary.parent.mkdir(parents=True, exist_ok=True)
     source = parquet_sources(sources)
-    connection = open_database(config)
+    connection = open_database(
+        config,
+        output_reserve_bytes=total_file_size(sources) * 2,
+    )
     try:
         exported_count = int(
             connection.execute(f"""
@@ -371,6 +384,15 @@ def build_intervals(
             manifest, key, stage_hash, source_signature, [output]
         ):
             continue
+        estimated_output_bytes = track_path.stat().st_size
+        free_before = ensure_storage_budget(
+            config,
+            f"build intervals for MMSI bucket {bucket:04d}",
+            estimated_output_bytes,
+        )
+        progress.set_postfix_str(
+            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
+        )
         started = time.perf_counter()
         temporary = temporary_file(output)
         temporary.unlink(missing_ok=True)
@@ -384,17 +406,25 @@ def build_intervals(
             temporary,
         )
         replace_file(temporary, output)
+        output_bytes = output.stat().st_size
+        free_after = free_space_bytes(config.storage.work_root)
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
             "interval_count": worker.value,
+            "output_bytes": output_bytes,
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        progress.set_postfix_str(
+            f"{bucket:04d} free={free_after / TIB:.2f}TiB"
+        )
 
     output_root = config.storage.work_root / "outputs" / "trajectory_intervals"
     export_signature = signature(
@@ -404,14 +434,25 @@ def build_intervals(
     if force or not item_is_complete(
         manifest, "yearly_export", stage_hash, export_signature, [output_root]
     ):
+        estimated_output_bytes = total_file_size(outputs) * 2
+        free_before = ensure_storage_budget(
+            config,
+            "export yearly trajectory intervals",
+            estimated_output_bytes,
+        )
         started = time.perf_counter()
         worker = run_isolated(_export_yearly, config, outputs, output_root)
+        output_bytes = directory_size(output_root)
+        free_after = free_space_bytes(config.storage.work_root)
         manifest["items"]["yearly_export"] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": export_signature,
             "output": str(output_root.resolve()),
             "interval_count": worker.value,
+            "output_bytes": output_bytes,
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),

@@ -5,19 +5,31 @@ from pathlib import Path
 import duckdb
 
 from extractais.config import AppConfig
+from extractais.storage import duckdb_temp_budget_bytes
 
 
 def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def open_database(config: AppConfig) -> duckdb.DuckDBPyConnection:
+def open_database(
+    config: AppConfig,
+    output_reserve_bytes: int = 0,
+) -> duckdb.DuckDBPyConnection:
     config.storage.temp_directory.mkdir(parents=True, exist_ok=True)
+    temp_budget_bytes = duckdb_temp_budget_bytes(config, output_reserve_bytes)
     connection = duckdb.connect(database=":memory:")
     connection.execute(f"SET threads = {config.runtime.threads}")
     connection.execute(f"SET memory_limit = {sql_literal(config.runtime.memory_limit)}")
     connection.execute(
         f"SET temp_directory = {sql_literal(str(config.storage.temp_directory.resolve()))}"
+    )
+    connection.execute(
+        f"SET max_temp_directory_size = {sql_literal(f'{temp_budget_bytes}B')}"
+    )
+    connection.execute(
+        "SET partitioned_write_max_open_files = "
+        f"{config.prepare.mmsi_buckets}"
     )
     connection.execute("SET preserve_insertion_order = false")
     if config.runtime.enable_progress:

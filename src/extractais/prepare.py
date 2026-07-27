@@ -27,6 +27,13 @@ from extractais.stage import (
     signature,
     utc_now,
 )
+from extractais.storage import (
+    TIB,
+    directory_size,
+    ensure_storage_budget,
+    free_space_bytes,
+    total_file_size,
+)
 
 
 def _split_records(config: AppConfig) -> list[Dict[str, Any]]:
@@ -53,8 +60,9 @@ def _monthly_records(records: Iterable[Dict[str, Any]]) -> Dict[str, list[Dict[s
 
 def _copy_partitioned_month(
     config: AppConfig, paths: list[Path], temporary: Path
-) -> None:
+) -> int:
     source = parquet_sources(paths)
+    output_reserve_bytes = total_file_size(paths) * 2
     select_sql = f"""
         SELECT
             *,
@@ -71,15 +79,16 @@ def _copy_partitioned_month(
             ROW_GROUP_SIZE {config.prepare.row_group_size}
         )
     """
-    connection = open_database(config)
+    connection = open_database(config, output_reserve_bytes=output_reserve_bytes)
     try:
-        connection.execute(query)
+        return int(connection.execute(query).fetchone()[0])
     finally:
         connection.close()
 
 
 def _compact_static(config: AppConfig, paths: list[Path], output: Path) -> int:
     source = parquet_sources(paths)
+    output_reserve_bytes = total_file_size(paths)
     select_sql = f"""
         SELECT
             mmsi,
@@ -112,16 +121,17 @@ def _compact_static(config: AppConfig, paths: list[Path], output: Path) -> int:
     temporary = temporary_file(output)
     temporary.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = open_database(config)
+    connection = open_database(config, output_reserve_bytes=output_reserve_bytes)
     try:
-        count = int(connection.execute(f"SELECT count(DISTINCT mmsi) FROM {source}").fetchone()[0])
-        connection.execute(
-            parquet_copy_sql(
-                select_sql,
-                temporary,
-                config.prepare.compression,
-                config.prepare.row_group_size,
-            )
+        count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    select_sql,
+                    temporary,
+                    config.prepare.compression,
+                    config.prepare.row_group_size,
+                )
+            ).fetchone()[0]
         )
         replace_file(temporary, output)
         return count
@@ -144,6 +154,7 @@ def _write_track_bucket(
     config: AppConfig, paths: list[Path], bucket: int, output: Path
 ) -> int:
     source = parquet_sources(paths)
+    output_reserve_bytes = total_file_size(paths) * 2
     distance = haversine_km("prev_latitude", "prev_longitude", "latitude", "longitude")
     select_sql = f"""
         WITH ranked AS (
@@ -206,16 +217,17 @@ def _write_track_bucket(
     temporary = temporary_file(output)
     temporary.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = open_database(config)
+    connection = open_database(config, output_reserve_bytes=output_reserve_bytes)
     try:
-        count = int(connection.execute(f"SELECT count(*) FROM {source}").fetchone()[0])
-        connection.execute(
-            parquet_copy_sql(
-                select_sql,
-                temporary,
-                config.prepare.compression,
-                config.prepare.row_group_size,
-            )
+        count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    select_sql,
+                    temporary,
+                    config.prepare.compression,
+                    config.prepare.row_group_size,
+                )
+            ).fetchone()[0]
         )
         replace_file(temporary, output)
         return count
@@ -256,6 +268,18 @@ def prepare_data(
         ):
             continue
 
+        source_bytes = total_file_size(
+            Path(record["dynamic_path"]) for record in month_records
+        )
+        estimated_output_bytes = source_bytes * 2
+        free_before = ensure_storage_budget(
+            config,
+            f"partition month {month}",
+            estimated_output_bytes,
+        )
+        month_progress.set_postfix_str(
+            f"{month} free={free_before / TIB:.2f}TiB"
+        )
         started = time.perf_counter()
         temporary = temporary_directory(output)
         remove_path(temporary, config.storage.work_root)
@@ -266,17 +290,32 @@ def prepare_data(
             [Path(record["dynamic_path"]) for record in month_records],
             temporary,
         )
+        output_bytes = directory_size(temporary)
         replace_directory(temporary, output, config.storage.work_root)
+        elapsed = time.perf_counter() - started
+        free_after = free_space_bytes(config.storage.work_root)
+        io_mib_per_second = (
+            (source_bytes + output_bytes) / 1024**2 / elapsed if elapsed else 0.0
+        )
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "row_count": worker.value,
+            "io_mib_per_second": round(io_mib_per_second, 2),
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "elapsed_seconds": round(elapsed, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        month_progress.set_postfix_str(
+            f"{month} {io_mib_per_second:.1f}MiB/s free={free_after / TIB:.2f}TiB"
+        )
 
     static_paths = [Path(record["static_path"]) for record in records]
     static_signature = signature(
@@ -287,19 +326,32 @@ def prepare_data(
     if force or not item_is_complete(
         manifest, "static", stage_hash, static_signature, [static_output]
     ):
+        source_bytes = total_file_size(static_paths)
+        free_before = ensure_storage_budget(
+            config,
+            "compact static AIS",
+            source_bytes,
+        )
         started = time.perf_counter()
         worker = run_isolated(
             _compact_static, config, static_paths, static_output
         )
         vessel_count = worker.value
+        elapsed = time.perf_counter() - started
+        output_bytes = static_output.stat().st_size
+        free_after = free_space_bytes(config.storage.work_root)
         manifest["items"]["static"] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": static_signature,
             "output": str(static_output.resolve()),
             "vessel_count": vessel_count,
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "elapsed_seconds": round(elapsed, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
@@ -324,20 +376,45 @@ def prepare_data(
             manifest, key, stage_hash, source_signature, [output]
         ):
             continue
+        source_bytes = total_file_size(paths)
+        estimated_output_bytes = source_bytes * 2
+        free_before = ensure_storage_budget(
+            config,
+            f"sort MMSI bucket {bucket:04d}",
+            estimated_output_bytes,
+        )
+        bucket_progress.set_postfix_str(
+            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
+        )
         started = time.perf_counter()
         worker = run_isolated(
             _write_track_bucket, config, paths, bucket, output
         )
-        source_rows = worker.value
+        track_rows = worker.value
+        elapsed = time.perf_counter() - started
+        output_bytes = output.stat().st_size
+        free_after = free_space_bytes(config.storage.work_root)
+        io_mib_per_second = (
+            (source_bytes + output_bytes) / 1024**2 / elapsed if elapsed else 0.0
+        )
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
-            "source_rows": source_rows,
+            "track_row_count": track_rows,
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "io_mib_per_second": round(io_mib_per_second, 2),
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "elapsed_seconds": round(elapsed, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        bucket_progress.set_postfix_str(
+            f"{bucket:04d} {io_mib_per_second:.1f}MiB/s "
+            f"free={free_after / TIB:.2f}TiB"
+        )
     return manifest

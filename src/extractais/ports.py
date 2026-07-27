@@ -26,6 +26,12 @@ from extractais.stage import (
     signature,
     utc_now,
 )
+from extractais.storage import (
+    directory_size,
+    ensure_storage_budget,
+    free_space_bytes,
+    total_file_size,
+)
 
 
 PORT_SIZE_RANK = {"Very Small": 1, "Small": 2, "Medium": 3, "Large": 4}
@@ -426,13 +432,19 @@ def _build_port_catalog_worker(
     stop_paths: list[Path],
     temporary: Path,
 ) -> Dict[str, int]:
+    output_reserve_bytes = (
+        total_file_size(stop_paths) * 2 + config.input.ports_csv.stat().st_size
+    )
     ports = _read_ports(config)
     ports, groups = _assign_port_groups(
         ports,
         config.ports.group_distance_km,
         config.runtime.enable_progress,
     )
-    connection = open_database(config)
+    connection = open_database(
+        config,
+        output_reserve_bytes=output_reserve_bytes,
+    )
     try:
         _write_port_tables(connection, temporary, ports, groups, config)
         _write_anchor_tables(connection, temporary, stop_paths, config)
@@ -481,6 +493,14 @@ def build_ports(
         return manifest
 
     started = time.perf_counter()
+    estimated_output_bytes = (
+        total_file_size(stop_paths) * 2 + config.input.ports_csv.stat().st_size
+    )
+    free_before = ensure_storage_budget(
+        config,
+        "build port catalog",
+        estimated_output_bytes,
+    )
     temporary = temporary_directory(output_root)
     remove_path(temporary, config.storage.work_root)
     temporary.mkdir(parents=True, exist_ok=True)
@@ -491,7 +511,9 @@ def build_ports(
         temporary,
     )
     counts = worker.value
+    output_bytes = directory_size(temporary)
     replace_directory(temporary, output_root, config.storage.work_root)
+    free_after = free_space_bytes(config.storage.work_root)
     manifest["items"]["catalog"] = {
         "status": "complete",
         "config_hash": stage_hash,
@@ -499,6 +521,9 @@ def build_ports(
         "output": str(output_root.resolve()),
         "port_count": counts["port_count"],
         "port_group_count": counts["port_group_count"],
+        "output_bytes": output_bytes,
+        "free_space_bytes_before": free_before,
+        "free_space_bytes_after": free_after,
         "worker_process_id": worker.process_id,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "completed_at_utc": utc_now(),

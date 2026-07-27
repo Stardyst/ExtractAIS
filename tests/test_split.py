@@ -5,7 +5,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-import extractais.split as split_module
+import extractais.storage as storage_module
 from extractais.config import load_config
 from extractais.inventory import discover_files
 from extractais.split import split_files
@@ -70,6 +70,7 @@ def test_split_separates_dynamic_static_and_counts_invalid(tmp_path: Path) -> No
         record["dynamic_output_bytes"] + record["static_output_bytes"]
     )
     assert record["compression_ratio"] > 0
+    assert record["free_space_bytes_before"] > 0
     assert record["free_space_bytes_after"] > 0
 
     dynamic = duckdb.read_parquet(record["dynamic_path"]).fetchone()
@@ -145,9 +146,9 @@ def test_split_stops_before_reading_when_free_space_guard_is_hit(
     config_path.write_text(config_text, encoding="utf-8")
     config = load_config(config_path)
     inventory = discover_files(config)
-    monkeypatch.setattr(split_module, "_free_space_bytes", lambda unused: 0)
+    monkeypatch.setattr(storage_module, "free_space_bytes", lambda unused: 0)
 
-    with pytest.raises(RuntimeError, match="Free-space guard stopped"):
+    with pytest.raises(RuntimeError, match="Storage guard stopped"):
         split_files(config, inventory.files, tmp_path)
 
     assert not (tmp_path / "work" / "stage01_split").exists()

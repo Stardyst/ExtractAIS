@@ -15,7 +15,8 @@ runtime:
   memory_limit: "100GB"
   enable_progress: true
   progress_bar_time_ms: 2000
-  # Stop before the next raw file when the work volume falls below this value.
+  # Preserve this much free space after the next estimated work-unit output.
+  # The guard applies to every stage and also caps DuckDB temporary spill files.
   minimum_free_space_gb: 500
 
 split:

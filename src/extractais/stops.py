@@ -19,6 +19,11 @@ from extractais.stage import (
     signature,
     utc_now,
 )
+from extractais.storage import (
+    TIB,
+    ensure_storage_budget,
+    free_space_bytes,
+)
 
 
 def track_bucket_files(config: AppConfig) -> list[Path]:
@@ -116,7 +121,10 @@ def _write_stop_bucket(config: AppConfig, source_path: Path, output: Path) -> in
     temporary = temporary_file(output)
     temporary.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = open_database(config)
+    connection = open_database(
+        config,
+        output_reserve_bytes=source_path.stat().st_size,
+    )
     try:
         result = connection.execute(
             parquet_copy_sql(
@@ -168,20 +176,35 @@ def build_stops(
             manifest, key, stage_hash, source_signature, [output]
         ):
             continue
+        source_bytes = source_path.stat().st_size
+        free_before = ensure_storage_budget(
+            config,
+            f"detect stops in MMSI bucket {bucket:04d}",
+            source_bytes,
+        )
+        progress.set_postfix_str(
+            f"{bucket:04d} free={free_before / TIB:.2f}TiB"
+        )
         started = time.perf_counter()
         worker = run_isolated(
             _write_stop_bucket, config, source_path, output
         )
         stop_count = worker.value
+        free_after = free_space_bytes(config.storage.work_root)
         manifest["items"][key] = {
             "status": "complete",
             "config_hash": stage_hash,
             "source_signature": source_signature,
             "output": str(output.resolve()),
             "stop_count": stop_count,
+            "free_space_bytes_before": free_before,
+            "free_space_bytes_after": free_after,
             "worker_process_id": worker.process_id,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "completed_at_utc": utc_now(),
         }
         save_stage_manifest(manifest_path, manifest)
+        progress.set_postfix_str(
+            f"{bucket:04d} free={free_after / TIB:.2f}TiB"
+        )
     return manifest
