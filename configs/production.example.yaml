@@ -7,39 +7,45 @@ input:
   ports_csv: "E:/AIS2021-2022/UpdatedPub150.csv"
 
 storage:
-  work_root: "E:/AIS2021-2022/derived"
-  temp_directory: "E:/AIS2021-2022/derived/tmp"
+  # F and G are separate physical HDDs. Partition N is permanently assigned
+  # to track_roots[N % 2], so each disk performs one sequential heavy query.
+  track_roots:
+    - "F:/ExtractAIS-v2"
+    - "G:/ExtractAIS-v2"
+  # D is NVMe and contains only DuckDB spill, heartbeats, and atomic temp files.
+  temp_root: "D:/ExtractAIS-v2-temp"
+  # H stores compact retained products. H-I are one physical disk, so H is not
+  # counted as an additional concurrent compute lane.
+  products_root: "H:/ExtractAIS-v2/products"
+  # E and I are on different physical disks during geometry-heavy stages.
+  evidence_roots:
+    - "E:/AIS2021-2022/ExtractAIS-v2-evidence"
+    - "I:/ExtractAIS-v2/evidence"
+  reserves_gib:
+    tracks: 1024
+    temp: 200
+    products: 300
+    evidence: 500
 
 runtime:
-  threads: 20
-  memory_limit: "90GB"
-  # One worker avoids random I/O on the production HDD. Prepare permanently
-  # subdivides large full-archive buckets before running window queries.
-  bucket_workers: 1
-  bucket_threads: 8
-  bucket_memory_limit: "80GB"
-  bucket_temp_limit_gb: 256
+  global_threads: 16
+  global_memory: "90GB"
+  workers_per_track_root: 1
+  worker_threads: 6
+  worker_memory: "40GB"
+  worker_temp_gib: 180
+  progress_interval_seconds: 5
   enable_progress: true
-  # Preserve this much free space after the next estimated work-unit output.
-  # The guard applies to every stage and also caps DuckDB temporary spill files.
-  minimum_free_space_gb: 500
 
-split:
+layout:
+  # Fixed before the first full run. A power of two is required.
+  track_partitions: 1024
+  row_group_size: 50000
+  compression: "zstd"
+
+cleaning:
   dynamic_message_types: [1, 2, 3, 18, 19, 27]
   static_message_types: [5, 24]
-  compression: "zstd"
-  row_group_size: 1000000
-
-prepare:
-  # 256 buckets keep monthly partitions above roughly 100 MiB. Stage 03 then
-  # hash-shards each full-archive bucket into bounded permanent work units.
-  # Do not change this after prepare has started.
-  mmsi_buckets: 256
-  # Keep one writer open per bucket. A lower value repeatedly closes writers
-  # and creates thousands of small Parquet files on production-scale months.
-  partition_write_max_open_files: 256
-  compression: "zstd"
-  row_group_size: 250000
   max_implied_speed_knots: 80
 
 stops:
@@ -61,7 +67,6 @@ ports:
   call_min_points: 2
   call_max_point_gap_hours: 6
   ambiguity_margin_km: 1
-  # Set to ["Very Small"] only after reviewing outputs/validation.
   excluded_harbor_sizes: []
 
 intervals:

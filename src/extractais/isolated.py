@@ -21,6 +21,7 @@ class IsolatedCall:
     target: Callable
     args: tuple = ()
     kwargs: dict | None = None
+    resource: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,8 +93,7 @@ def run_isolated_many(
         raise ValueError("worker_exit_timeout_seconds must be positive")
 
     context = multiprocessing.get_context("spawn")
-    pending = iter(calls)
-    exhausted = False
+    pending = list(calls)
     active: dict[str, dict[str, Any]] = {}
     failures: list[dict[str, Any]] = []
 
@@ -118,13 +118,25 @@ def run_isolated_many(
         active.clear()
 
     try:
-        while not exhausted or active:
-            while not exhausted and len(active) < max_workers:
-                try:
-                    call = next(pending)
-                except StopIteration:
-                    exhausted = True
+        while pending or active:
+            while pending and len(active) < max_workers:
+                active_resources = {
+                    state["resource"]
+                    for state in active.values()
+                    if state["resource"] is not None
+                }
+                candidate_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(pending)
+                        if candidate.resource is None
+                        or candidate.resource not in active_resources
+                    ),
+                    None,
+                )
+                if candidate_index is None:
                     break
+                call = pending.pop(candidate_index)
                 if call.key in active:
                     raise ValueError(f"Duplicate active isolated-call key: {call.key}")
                 if before_start is not None:
@@ -159,6 +171,7 @@ def run_isolated_many(
                     "process": process,
                     "started": started,
                     "phase": "running",
+                    "resource": call.resource,
                 }
 
             if on_poll is not None:
@@ -232,11 +245,11 @@ def run_isolated_many(
                             "traceback": "",
                         }
                     )
-                    exhausted = True
+                    pending.clear()
                     continue
                 if not payload["ok"]:
                     failures.append(payload)
-                    exhausted = True
+                    pending.clear()
                     continue
                 yield IsolatedTaskResult(
                     key=key,

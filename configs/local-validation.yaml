@@ -1,45 +1,39 @@
 input:
-  raw_root: ".."
+  raw_root: "../sample-input"
   year_directories:
-    2021: "unused"
-    2022: "unused"
+    2021: "2021"
+    2022: "2022"
   filename_pattern: "*.csv"
   ports_csv: "../UpdatedPub150.csv"
-
 storage:
-  work_root: "../work/local-validation"
-  temp_directory: "../work/local-validation/tmp"
-
+  track_roots: ["../work/track-a", "../work/track-b"]
+  temp_root: "../work/temp"
+  products_root: "../work/products"
+  evidence_roots: ["../work/evidence-a", "../work/evidence-b"]
+  reserves_gib: {tracks: 0, temp: 0, products: 0, evidence: 0}
 runtime:
-  threads: 4
-  memory_limit: "4GB"
-  bucket_workers: 2
-  bucket_threads: 2
-  bucket_memory_limit: "1536MB"
-  bucket_temp_limit_gb: 1
+  global_threads: 4
+  global_memory: "4GB"
+  workers_per_track_root: 1
+  worker_threads: 2
+  worker_memory: "1536MB"
+  worker_temp_gib: 1
+  progress_interval_seconds: 1
   enable_progress: true
-  minimum_free_space_gb: 1
-
-split:
+layout:
+  track_partitions: 8
+  row_group_size: 10000
+  compression: "zstd"
+cleaning:
   dynamic_message_types: [1, 2, 3, 18, 19, 27]
   static_message_types: [5, 24]
-  compression: "zstd"
-  row_group_size: 10000
-
-prepare:
-  mmsi_buckets: 8
-  partition_write_max_open_files: 8
-  compression: "zstd"
-  row_group_size: 10000
   max_implied_speed_knots: 80
-
 stops:
   max_speed_knots: 0.5
   max_step_km: 0.25
   max_point_gap_minutes: 60
   min_duration_minutes: 60
   max_diameter_km: 1.0
-
 ports:
   entry_radius_km: 3
   exit_radius_km: 4
@@ -53,6 +47,5 @@ ports:
   call_max_point_gap_hours: 6
   ambiguity_margin_km: 1
   excluded_harbor_sizes: []
-
 intervals:
   unknown_gap_hours: 6

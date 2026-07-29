@@ -1,298 +1,372 @@
 from __future__ import annotations
 
-import os
-import time
+import json
+import shutil
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
-from tqdm import tqdm
-
+from extractais.calls import group_candidate_path
+from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql, sql_literal
-from extractais.fileutils import remove_path, replace_directory, temporary_directory
-from extractais.gitmeta import git_commit
-from extractais.isolated import run_isolated
-from extractais.manifest import write_json_atomic
-from extractais.progress import HONEST_BAR_FORMAT, format_duration
+from extractais.intervals import interval_path
+from extractais.isolated import IsolatedCall
+from extractais.runtime import StageTask, atomic_replace, heartbeat, run_stage_tasks, signature, write_json_atomic
 from extractais.sql import parquet_sources
-from extractais.stage import (
-    item_is_complete,
-    load_stage_manifest,
-    save_stage_manifest,
-    signature,
-    utc_now,
-)
 from extractais.storage import (
-    GIB,
-    directory_size,
-    ensure_storage_budget,
-    free_space_bytes,
+    ensure_space,
+    evidence_root_for_partition,
+    lane_for_partition,
+    port_call_path,
+    port_context_path,
+    shared_output_requirement,
+    shared_temp_requirement,
+    total_file_size,
 )
 
 
-def _csv_copy(connection, select_sql: str, output: Path) -> None:
-    connection.execute(f"""
-        COPY ({select_sql}) TO {sql_literal(str(output.resolve()))}
-        (FORMAT CSV, HEADER true)
-    """)
+def _partial_paths(config: AppConfig, partition: int) -> tuple[Path, Path, Path]:
+    root = config.storage.products_root / "validation" / "partials"
+    return (
+        root / "states" / f"partition={partition:04d}.parquet",
+        root / "ports" / f"partition={partition:04d}.parquet",
+        root / "ambiguous" / f"partition={partition:04d}.parquet",
+    )
 
 
-def _build_validation_in_process(
-    config: AppConfig, project_root: Path, force: bool = False
-) -> Dict[str, Any]:
-    calls = sorted(
-        (config.storage.work_root / "stage06_port_calls").glob(
-            "mmsi_bucket=*/port_calls.parquet"
-        )
-    )
-    contexts = sorted(
-        (config.storage.work_root / "stage06_port_calls").glob(
-            "mmsi_bucket=*/port_context.parquet"
-        )
-    )
-    intervals = sorted(
-        (config.storage.work_root / "outputs" / "trajectory_intervals").glob(
-            "year=*/mmsi_bucket=*.parquet"
-        )
-    )
-    ports_root = config.storage.work_root / "stage05_ports"
-    port_dependencies = [
-        ports_root / "port_groups.parquet",
-        ports_root / "port_coverage.parquet",
-        ports_root / "unmatched_anchor_candidates.parquet",
+def _validation_partial_worker(
+    config: AppConfig,
+    partition: int,
+    outputs: tuple[Path, Path, Path],
+    heartbeat_path: Path,
+) -> dict[str, int]:
+    temporary_outputs = tuple(path.with_name(path.stem + ".tmp" + path.suffix) for path in outputs)
+    worker_temp = config.storage.temp_root / f"validation-{partition:04d}"
+    shutil.rmtree(worker_temp, ignore_errors=True)
+    for path in temporary_outputs:
+        path.unlink(missing_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    intervals = [
+        interval_path(config, year, partition)
+        for year in sorted(config.input.year_directories)
     ]
-    dependencies = calls + contexts + intervals + port_dependencies
-    if not calls or not contexts or not intervals or not all(path.exists() for path in port_dependencies):
-        raise RuntimeError("Final-stage artifacts are incomplete; run `extractais intervals` first")
-
-    source_signature = signature(
-        (str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
-        for path in dependencies
+    calls = port_call_path(config, partition)
+    context = port_context_path(config, partition)
+    group_candidates = group_candidate_path(config, partition)
+    source_bytes = total_file_size([*intervals, calls, context, group_candidates])
+    ensure_space(
+        config.storage.products_root,
+        config.storage.reserves_gib["products"],
+        shared_output_requirement(config, max(source_bytes, 1024**2)),
+        f"validation partial {partition:04d}",
     )
-    stage_hash = config.stage_hash("ports", "intervals")
-    manifest_path = config.storage.work_root / "manifests" / "validate.json"
-    manifest = load_stage_manifest(manifest_path, "validate")
-    manifest["config_hash"] = stage_hash
-    manifest["git_commit"] = git_commit(project_root)
-    output_root = config.storage.work_root / "outputs" / "validation"
-    required = [
-        output_root / "port_quality.parquet",
-        output_root / "port_quality.csv",
-        output_root / "harbor_size_quality.csv",
-        output_root / "state_summary.csv",
-        output_root / "ambiguous_port_points.parquet",
-        output_root / "summary.json",
-    ]
-    if not force and item_is_complete(
-        manifest, "reports", stage_hash, source_signature, required
-    ):
-        return manifest
-
-    estimated_output_bytes = GIB
-    free_before = ensure_storage_budget(
-        config,
-        "build validation reports",
-        estimated_output_bytes,
+    ensure_space(
+        config.storage.temp_root,
+        config.storage.reserves_gib["temp"],
+        shared_temp_requirement(config),
+        f"validation temporary {partition:04d}",
     )
-    started = time.perf_counter()
-    temporary = temporary_directory(output_root)
-    remove_path(temporary, config.storage.work_root)
-    temporary.mkdir(parents=True, exist_ok=True)
-    connection = open_database(
-        config,
-        output_reserve_bytes=estimated_output_bytes,
-    )
+    connection = open_database(config, worker_temp, worker=True)
     try:
-        calls_source = parquet_sources(calls)
-        contexts_source = parquet_sources(contexts)
-        intervals_source = parquet_sources(intervals)
-        groups_source = parquet_sources([ports_root / "port_groups.parquet"])
-        coverage_source = parquet_sources([ports_root / "port_coverage.parquet"])
-        unmatched_source = parquet_sources(
-            [ports_root / "unmatched_anchor_candidates.parquet"]
+        heartbeat(heartbeat_path, "summarizing interval states")
+        state_count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    f"""
+                    SELECT
+                        year, state, quality_flag,
+                        count(*) AS interval_count,
+                        sum(ais_point_count) AS ais_point_count,
+                        count(DISTINCT mmsi) AS vessel_count
+                    FROM {parquet_sources(intervals)}
+                    GROUP BY year, state, quality_flag
+                    """,
+                    temporary_outputs[0],
+                    config,
+                    order_by="year, state, quality_flag",
+                )
+            ).fetchone()[0]
         )
-        connection.execute(f"CREATE TEMP VIEW all_calls AS SELECT * FROM {calls_source}")
+        heartbeat(heartbeat_path, "summarizing port calls")
+        port_count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    f"""
+                    SELECT
+                        port_group_id,
+                        arg_min(port_group_name, entry_time_utc) AS port_group_name,
+                        arg_min(port_country_or_area, entry_time_utc)
+                            AS country_or_area_name,
+                        count(*) AS port_call_count,
+                        count(DISTINCT mmsi) AS vessel_count,
+                        count(*) FILTER (WHERE has_port_ambiguity)
+                            AS ambiguous_call_count,
+                        min(minimum_ambiguity_margin_km)
+                            AS minimum_ambiguity_margin_km
+                    FROM {parquet_sources([calls])}
+                    GROUP BY port_group_id
+                    """,
+                    temporary_outputs[1],
+                    config,
+                    order_by="port_group_id",
+                )
+            ).fetchone()[0]
+        )
+        heartbeat(heartbeat_path, "writing ambiguous point evidence")
+        ambiguous_count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    f"""
+                    SELECT
+                        c.mmsi, c.point_seq, c.timestamp_utc,
+                        c.latitude, c.longitude,
+                        x.port_group_id, x.port_group_name,
+                        x.second_port_group_id, x.second_port_group_name,
+                        x.port_distance_km, x.second_port_distance_km,
+                        x.ambiguity_margin_km, x.track_partition_id
+                    FROM {parquet_sources([context])} x
+                    JOIN {parquet_sources([group_candidates])} c
+                      ON x.mmsi = c.mmsi
+                     AND x.point_seq = c.point_seq
+                     AND c.candidate_rank = 1
+                    WHERE x.ambiguity_margin_km < {config.ports.ambiguity_margin_km}
+                    """,
+                    temporary_outputs[2],
+                    config,
+                    order_by="mmsi, point_seq",
+                )
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+        shutil.rmtree(worker_temp, ignore_errors=True)
+    for temporary, output in zip(temporary_outputs, outputs):
+        atomic_replace(temporary, output)
+    heartbeat(heartbeat_path, "committed")
+    return {
+        "row_count": state_count + port_count + ambiguous_count,
+        "output_bytes": sum(path.stat().st_size for path in outputs),
+    }
+
+
+def _merge_validation_worker(
+    config: AppConfig,
+    state_paths: list[Path],
+    port_paths: list[Path],
+    ambiguous_paths: list[Path],
+    outputs: tuple[Path, Path, Path, Path],
+    heartbeat_path: Path,
+) -> dict[str, int]:
+    state_csv, port_csv, harbor_csv, ambiguous_output = outputs
+    temporary = tuple(path.with_name(path.stem + ".tmp" + path.suffix) for path in outputs)
+    worker_temp = config.storage.temp_root / "validation-merge"
+    source_bytes = total_file_size([*state_paths, *port_paths, *ambiguous_paths])
+    ensure_space(
+        config.storage.products_root,
+        config.storage.reserves_gib["products"],
+        max(source_bytes, 1024**2),
+        "validation reports",
+    )
+    ensure_space(
+        config.storage.temp_root,
+        config.storage.reserves_gib["temp"],
+        shared_temp_requirement(config),
+        "validation merge temporary data",
+    )
+    shutil.rmtree(worker_temp, ignore_errors=True)
+    for path in temporary:
+        path.unlink(missing_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    connection = open_database(config, worker_temp, worker=False)
+    try:
+        heartbeat(heartbeat_path, "merging state summaries")
         connection.execute(
-            f"CREATE TEMP VIEW all_contexts AS SELECT * FROM {contexts_source}"
+            f"""
+            COPY (
+                SELECT
+                    year, state, quality_flag,
+                    sum(interval_count) AS interval_count,
+                    sum(ais_point_count) AS ais_point_count,
+                    sum(vessel_count) AS vessel_count
+                FROM {parquet_sources(state_paths)}
+                GROUP BY year, state, quality_flag
+                ORDER BY year, state, quality_flag
+            ) TO {sql_literal(str(temporary[0].resolve()))} (HEADER, DELIMITER ',')
+            """
         )
+        heartbeat(heartbeat_path, "merging port quality")
+        coverage = parquet_sources([config.storage.products_root / "ports" / "port_coverage.parquet"])
         connection.execute(
-            f"CREATE TEMP VIEW all_intervals AS SELECT * FROM {intervals_source}"
-        )
-        port_quality_sql = f"""
-            WITH call_metrics AS (
+            f"""
+            CREATE TEMP TABLE port_quality AS
+            WITH calls AS (
                 SELECT
                     port_group_id,
-                    count(*) AS port_call_count,
-                    count(DISTINCT mmsi) AS calling_vessel_count,
-                    median(minimum_port_distance_km) AS median_minimum_distance_km,
-                    avg((matched_stop_count > 0)::INTEGER) AS stop_confirmed_fraction,
-                    avg((source_at_dock_points > 0)::INTEGER) AS source_at_dock_fraction,
-                    avg((source_matched_port_points > 0)::INTEGER)
-                        AS source_matched_port_fraction,
-                    avg((minimum_ambiguity_margin_km < {config.ports.ambiguity_margin_km})::INTEGER)
-                        AS ambiguous_call_fraction
-                FROM all_calls
+                    sum(port_call_count) AS port_call_count,
+                    sum(vessel_count) AS vessel_count,
+                    sum(ambiguous_call_count) AS ambiguous_call_count,
+                    min(minimum_ambiguity_margin_km) AS minimum_ambiguity_margin_km
+                FROM {parquet_sources(port_paths)}
                 GROUP BY port_group_id
             )
             SELECT
-                g.port_group_id, g.port_group_name, g.harbor_size,
-                g.member_port_count, c.anchor_count, c.supporting_stop_events,
-                c.anchor_vessel_support, c.source_at_dock_points,
-                coalesce(m.port_call_count, 0) AS port_call_count,
-                coalesce(m.calling_vessel_count, 0) AS calling_vessel_count,
-                m.median_minimum_distance_km, m.stop_confirmed_fraction,
-                m.source_at_dock_fraction, m.source_matched_port_fraction,
-                m.ambiguous_call_fraction,
-                CASE
-                    WHEN c.anchor_count = 0 THEN 'NO_ANCHOR'
-                    WHEN coalesce(m.port_call_count, 0) = 0 THEN 'NO_CALL'
-                    WHEN coalesce(m.ambiguous_call_fraction, 0) >= 0.25 THEN 'HIGH_AMBIGUITY'
-                    ELSE 'REVIEWABLE'
-                END AS review_status
-            FROM {groups_source} g
-            LEFT JOIN {coverage_source} c USING (port_group_id)
-            LEFT JOIN call_metrics m USING (port_group_id)
-            ORDER BY review_status, port_call_count DESC, port_group_id
-        """
-        connection.execute(f"CREATE TEMP TABLE port_quality AS {port_quality_sql}")
-        connection.execute(
-            parquet_copy_sql(
-                "SELECT * FROM port_quality",
-                temporary / "port_quality.parquet",
-                config.prepare.compression,
-                config.prepare.row_group_size,
-            )
+                c.*,
+                coalesce(p.port_call_count, 0) AS port_call_count,
+                coalesce(p.vessel_count, 0) AS calling_vessel_count,
+                coalesce(p.ambiguous_call_count, 0) AS ambiguous_call_count,
+                p.minimum_ambiguity_margin_km,
+                CASE WHEN coalesce(p.port_call_count, 0) > 0
+                     THEN p.ambiguous_call_count::DOUBLE / p.port_call_count END
+                    AS ambiguity_rate
+            FROM {coverage} c
+            LEFT JOIN calls p USING (port_group_id)
+            """
         )
-        _csv_copy(connection, "SELECT * FROM port_quality", temporary / "port_quality.csv")
-
-        harbor_sql = f"""
-            SELECT
-                harbor_size,
-                count(*) AS port_group_count,
-                count(*) FILTER (WHERE anchor_count > 0) AS groups_with_anchor,
-                sum(port_call_count) AS port_call_count,
-                sum(calling_vessel_count) AS summed_calling_vessels,
-                avg(ambiguous_call_fraction) AS mean_ambiguous_call_fraction,
-                avg(stop_confirmed_fraction) AS mean_stop_confirmed_fraction
-            FROM port_quality
-            GROUP BY harbor_size
-            ORDER BY CASE harbor_size
-                WHEN 'Large' THEN 1 WHEN 'Medium' THEN 2 WHEN 'Small' THEN 3
-                WHEN 'Very Small' THEN 4 ELSE 5 END
-        """
-        _csv_copy(connection, harbor_sql, temporary / "harbor_size_quality.csv")
-
-        state_sql = """
-            SELECT
-                year, state, quality_flag,
-                count(*) AS interval_count,
-                count(DISTINCT mmsi) AS vessel_count,
-                sum(point_count) AS point_count
-            FROM all_intervals
-            GROUP BY year, state, quality_flag
-            ORDER BY year, state, quality_flag
-        """
-        _csv_copy(connection, state_sql, temporary / "state_summary.csv")
-
-        ambiguity_sql = f"""
-            SELECT
-                mmsi, timestamp_utc, latitude, longitude,
-                port_group_id AS first_port_group_id,
-                port_group_name AS first_port_group_name,
-                port_distance_km AS first_distance_km,
-                second_port_group_id,
-                second_port_group_name,
-                second_port_distance_km AS second_distance_km,
-                ambiguity_margin_km AS margin_km
-            FROM all_contexts
-            WHERE ambiguity_margin_km < {config.ports.ambiguity_margin_km}
-            ORDER BY margin_km, mmsi, timestamp_utc
-            LIMIT 100000
-        """
         connection.execute(
-            parquet_copy_sql(
-                ambiguity_sql,
-                temporary / "ambiguous_port_points.parquet",
-                config.prepare.compression,
-                config.prepare.row_group_size,
-            )
+            f"COPY (SELECT * FROM port_quality ORDER BY port_group_id) "
+            f"TO {sql_literal(str(temporary[1].resolve()))} (HEADER, DELIMITER ',')"
         )
-
-        summary = {
-            "generated_at_utc": utc_now(),
-            "config_hash": stage_hash,
-            "git_commit": git_commit(project_root),
-            "port_groups": int(
-                connection.execute(f"SELECT count(*) FROM {groups_source}").fetchone()[0]
-            ),
-            "port_groups_with_anchors": int(
-                connection.execute(
-                    f"SELECT count(*) FROM {coverage_source} WHERE anchor_count > 0"
-                ).fetchone()[0]
-            ),
-            "unmatched_anchor_candidates": int(
-                connection.execute(f"SELECT count(*) FROM {unmatched_source}").fetchone()[0]
-            ),
-            "port_calls": int(connection.execute("SELECT count(*) FROM all_calls").fetchone()[0]),
-            "trajectory_intervals": int(
-                connection.execute("SELECT count(*) FROM all_intervals").fetchone()[0]
-            ),
-            "unknown_gap_intervals": int(
-                connection.execute(
-                    "SELECT count(*) FROM all_intervals WHERE state = 'UNKNOWN_GAP'"
-                ).fetchone()[0]
-            ),
-        }
-        write_json_atomic(temporary / "summary.json", summary)
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    harbor_size,
+                    count(*) AS port_group_count,
+                    count(*) FILTER (WHERE anchor_count > 0) AS recognized_group_count,
+                    sum(port_call_count) AS port_call_count,
+                    sum(calling_vessel_count) AS calling_vessel_count,
+                    sum(ambiguous_call_count) AS ambiguous_call_count
+                FROM port_quality
+                GROUP BY harbor_size
+                ORDER BY harbor_size
+            ) TO {sql_literal(str(temporary[2].resolve()))} (HEADER, DELIMITER ',')
+            """
+        )
+        ambiguous_count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    f"SELECT * FROM {parquet_sources(ambiguous_paths)}",
+                    temporary[3],
+                    config,
+                    order_by="track_partition_id, mmsi, point_seq",
+                )
+            ).fetchone()[0]
+        )
     finally:
         connection.close()
-    output_bytes = directory_size(temporary)
-    replace_directory(temporary, output_root, config.storage.work_root)
-    free_after = free_space_bytes(config.storage.work_root)
-    manifest["items"]["reports"] = {
-        "status": "complete",
-        "config_hash": stage_hash,
-        "source_signature": source_signature,
-        "output": str(output_root.resolve()),
-        "output_bytes": output_bytes,
-        "free_space_bytes_before": free_before,
-        "free_space_bytes_after": free_after,
-        "worker_process_id": os.getpid(),
-        "elapsed_seconds": round(time.perf_counter() - started, 3),
-        "completed_at_utc": utc_now(),
+        shutil.rmtree(worker_temp, ignore_errors=True)
+    for source, output in zip(temporary, outputs):
+        atomic_replace(source, output)
+    heartbeat(heartbeat_path, "committed")
+    return {
+        "row_count": ambiguous_count,
+        "output_bytes": sum(path.stat().st_size for path in outputs),
     }
-    save_stage_manifest(manifest_path, manifest)
-    return manifest
 
 
-def build_validation(
-    config: AppConfig, project_root: Path, force: bool = False
-) -> Dict[str, Any]:
-    started = time.perf_counter()
-    progress = tqdm(
-        total=1,
-        desc="build validation reports",
-        disable=not config.runtime.enable_progress,
-        dynamic_ncols=True,
-        bar_format=HONEST_BAR_FORMAT,
-    )
-
-    def on_poll(active) -> None:
-        progress.set_postfix_str(
-            f"elapsed={format_duration(time.perf_counter() - started)} "
-            "ETA calibrating"
+def build_validation(config: AppConfig, store: CheckpointStore) -> None:
+    tasks: list[StageTask] = []
+    stage_hash = signature([config.raw["ports"], config.raw["intervals"]])
+    for partition in range(config.layout.track_partitions):
+        dependencies = [
+            port_call_path(config, partition),
+            port_context_path(config, partition),
+            group_candidate_path(config, partition),
+            *[
+                interval_path(config, year, partition)
+                for year in sorted(config.input.year_directories)
+            ],
+        ]
+        outputs = _partial_paths(config, partition)
+        task_signature = signature(
+            [stage_hash, [(path.stat().st_size, path.stat().st_mtime_ns) for path in dependencies]]
         )
-        progress.refresh()
-
-    worker = run_isolated(
-        _build_validation_in_process,
-        config,
-        project_root,
-        force,
-        _on_poll=on_poll,
+        beat = config.storage.temp_root / "heartbeats" / f"validation-{partition:04d}.json"
+        tasks.append(
+            StageTask(
+                key=f"{partition:04d}", signature=task_signature,
+                source_bytes=max(1, sum(path.stat().st_size for path in dependencies)),
+                outputs=outputs, heartbeat_path=beat,
+                call=IsolatedCall(
+                    key=f"{partition:04d}", target=_validation_partial_worker,
+                    args=(config, partition, outputs, beat),
+                    resource=(
+                        f"{lane_for_partition(config, partition)}|"
+                        f"{evidence_root_for_partition(config, partition)}"
+                    ),
+                ),
+            )
+        )
+    run_stage_tasks(
+        config, store, "validation_partials", tasks,
+        lambda _task, value, _pid, _elapsed: (
+            int(value["output_bytes"]), int(value["row_count"])
+        ),
     )
-    elapsed = time.perf_counter() - started
-    progress.update(1)
-    progress.set_postfix_str(f"elapsed={format_duration(elapsed)}")
-    progress.close()
-    return worker.value
+
+    state_paths, port_paths, ambiguous_paths = zip(
+        *[_partial_paths(config, partition) for partition in range(config.layout.track_partitions)]
+    )
+    validation_root = config.storage.products_root / "validation"
+    outputs = (
+        validation_root / "state_summary.csv",
+        validation_root / "port_quality.csv",
+        validation_root / "harbor_size_quality.csv",
+        validation_root / "ambiguous_port_points.parquet",
+    )
+    merge_signature = signature(
+        [
+            stage_hash,
+            [(path.stat().st_size, path.stat().st_mtime_ns) for path in (*state_paths, *port_paths, *ambiguous_paths)],
+        ]
+    )
+    merge_beat = config.storage.temp_root / "heartbeats" / "validation-merge.json"
+    run_stage_tasks(
+        config,
+        store,
+        "validation",
+        [
+            StageTask(
+                key="global",
+                signature=merge_signature,
+                source_bytes=max(
+                    1,
+                    sum(
+                        path.stat().st_size
+                        for path in (*state_paths, *port_paths, *ambiguous_paths)
+                    ),
+                ),
+                outputs=outputs,
+                heartbeat_path=merge_beat,
+                call=IsolatedCall(
+                    key="global",
+                    target=_merge_validation_worker,
+                    args=(
+                        config,
+                        list(state_paths),
+                        list(port_paths),
+                        list(ambiguous_paths),
+                        outputs,
+                        merge_beat,
+                    ),
+                    resource="validation-products",
+                ),
+            )
+        ],
+        lambda _task, value, _pid, _elapsed: (
+            int(value["output_bytes"]), int(value["row_count"])
+        ),
+    )
+
+    summary = {
+        "pipeline_version": "2.0.0",
+        "track_partitions": config.layout.track_partitions,
+        "years": sorted(config.input.year_directories),
+        "trajectory_intervals": str((config.storage.products_root / "trajectory_intervals").resolve()),
+        "port_quality": str((validation_root / "port_quality.csv").resolve()),
+        "country_fields": [
+            "from_port_country_or_area",
+            "to_port_country_or_area",
+        ],
+    }
+    write_json_atomic(validation_root / "summary.json", summary)

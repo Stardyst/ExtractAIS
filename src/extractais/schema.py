@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 DYNAMIC_TYPES_DEFAULT = (1, 2, 3, 18, 19, 27)
 STATIC_TYPES_DEFAULT = (5, 24)
@@ -173,3 +175,13 @@ WHERE msg_type IN ({static_types})
   AND timestamp_utc IS NOT NULL
   AND mmsi IS NOT NULL
 """
+
+
+def normalized_day_sql(input_path: Path) -> str:
+    from extractais.database import sql_literal
+
+    raw = RAW_PROJECTION.format(input_path=sql_literal(str(input_path.resolve())))
+    return f"""
+        WITH raw_day AS ({raw})
+        {NORMALIZED_PROJECTION}
+    """

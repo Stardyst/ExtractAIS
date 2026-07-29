@@ -2,161 +2,144 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Callable, Optional
 
-from extractais.calls import build_port_calls
+from extractais.calls import build_calls
+from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig, load_config
+from extractais.geometry import build_geometry
+from extractais.ingest import ingest
 from extractais.intervals import build_intervals
-from extractais.inventory import Inventory, discover_files
-from extractais.manifest import read_json, write_json_atomic
+from extractais.pipeline import checkpoint_path, inventory_signature, run_pipeline
 from extractais.ports import build_ports
-from extractais.prepare import prepare_data
-from extractais.split import split_files
-from extractais.stops import build_stops
+from extractais.runtime import write_json_atomic
+from extractais.storage import GIB, directory_size, free_space_bytes
+from extractais.tracks import build_tracks, cleanup_ingest_runs, tracks_are_complete
 from extractais.validate import build_validation
 
 
-def _paths(values: Optional[Iterable[str]]) -> Optional[list[Path]]:
-    return [Path(value) for value in values] if values else None
-
-
-def _inventory(config: AppConfig, explicit: Optional[list[Path]]) -> Inventory:
-    inventory = discover_files(config, explicit_files=explicit)
-    path = config.storage.work_root / "manifests" / "input_inventory.json"
-    write_json_atomic(path, inventory.to_dict())
-    return inventory
-
-
-def _add_force(subparser: argparse.ArgumentParser) -> None:
-    subparser.add_argument(
-        "--force", action="store_true", help="rebuild completed items in this stage"
-    )
+STAGES = (
+    "ingest",
+    "tracks",
+    "anchor_cells",
+    "anchors",
+    "port_groups",
+    "geometry",
+    "calls",
+    "intervals",
+    "validation_partials",
+    "validation",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="extractais")
-    parser.add_argument("--config", type=Path, required=True)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    inventory_parser = subparsers.add_parser("inventory", help="inventory raw daily CSV files")
-    inventory_parser.add_argument("--input-file", action="append")
-
-    split_parser = subparsers.add_parser("split", help="separate dynamic and static AIS")
-    split_parser.add_argument("--input-file", action="append")
-    split_parser.add_argument("--limit-files", type=int)
-    _add_force(split_parser)
-
-    for name, help_text in (
-        ("prepare", "compact static AIS and build bounded track work units"),
-        ("stops", "detect stationary events"),
-        ("ports", "build port groups and multi-circle anchors"),
-        ("calls", "match positions and confirm port calls"),
-        ("intervals", "build five-state annual trajectory intervals"),
-        ("validate", "build port and state quality reports"),
-    ):
-        stage_parser = subparsers.add_parser(name, help=help_text)
-        _add_force(stage_parser)
-
-    run_parser = subparsers.add_parser("run-all", help="run or resume the complete pipeline")
-    run_parser.add_argument("--input-file", action="append")
-    run_parser.add_argument("--limit-files", type=int)
-    _add_force(run_parser)
-    subparsers.add_parser("status", help="show checkpoint completion and output paths")
+    parser = argparse.ArgumentParser(
+        prog="extractais",
+        description="ExtractAIS v2: resumable multi-disk AIS trajectory processing",
+    )
+    parser.add_argument("--config", required=True, type=Path)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("inventory", help="scan raw daily CSV files without processing")
+    commands.add_parser("ingest", help="normalize each raw file once into sorted lane runs")
+    commands.add_parser("tracks", help="build canonical tracks, vessels, and stop events")
+    commands.add_parser("ports", help="build multi-circle anchors and independent port groups")
+    commands.add_parser("geometry", help="calculate point-to-anchor evidence")
+    commands.add_parser("calls", help="confirm port calls from geometry and port groups")
+    commands.add_parser("intervals", help="build annual five-state trajectory intervals")
+    commands.add_parser("validate", help="build accuracy evidence and quality summaries")
+    commands.add_parser("run-all", help="run or resume the complete v2 pipeline")
+    status = commands.add_parser("status", help="show checkpoints, storage, and output paths")
+    status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    commands.add_parser(
+        "cleanup-staging",
+        help="remove ingest runs only after all canonical track partitions are complete",
+    )
     return parser
 
 
-def _stage_summary(manifest: dict[str, Any]) -> dict[str, Any]:
-    items = manifest.get("items", {})
-    return {
-        "stage": manifest.get("stage"),
-        "completed_items": sum(item.get("status") == "complete" for item in items.values()),
-        "failed_items": sum(item.get("status") == "failed" for item in items.values()),
-    }
-
-
-def _status(config: AppConfig) -> dict[str, Any]:
-    config.storage.work_root.mkdir(parents=True, exist_ok=True)
-    free_space_gb = shutil.disk_usage(config.storage.work_root).free / 1024**3
-    manifest_root = config.storage.work_root / "manifests"
-    stages: dict[str, Any] = {}
-    split = read_json(manifest_root / "split.json", {"files": {}})
-    split_files_state = split.get("files", {})
-    stages["split"] = {
-        "completed_files": sum(
-            row.get("status") == "complete" for row in split_files_state.values()
-        ),
-        "failed_files": sum(row.get("status") == "failed" for row in split_files_state.values()),
-    }
-    prepare_manifest: dict[str, Any] = {}
-    for name in ("prepare", "stops", "ports", "calls", "intervals", "validate"):
-        manifest = read_json(manifest_root / f"{name}.json", {"stage": name, "items": {}})
-        stages[name] = _stage_summary(manifest)
-        if name == "prepare":
-            prepare_manifest = manifest
-    track_source_items = [
-        item
-        for key, item in prepare_manifest.get("items", {}).items()
-        if key.startswith("track-source:") and item.get("status") == "complete"
-    ]
-    stages["prepare"].update(
-        {
-            "completed_track_source_buckets": len(track_source_items),
-            "completed_track_work_units": sum(
-                int(item.get("active_shard_count", 0)) for item in track_source_items
-            ),
-            "track_layout": read_json(
-                config.storage.work_root / "stage03_tracks" / "_layout.json", {}
-            ),
-        }
+def _inventory(config: AppConfig):
+    inventory, inventory_hash = inventory_signature(config)
+    write_json_atomic(
+        config.storage.products_root / "metadata" / "input_inventory.json",
+        inventory.to_dict(),
     )
+    return inventory, inventory_hash
+
+
+def _status(config: AppConfig) -> dict[str, object]:
+    state = checkpoint_path(config)
+    counts: dict[str, int] = {stage: 0 for stage in STAGES}
+    if state.exists():
+        with CheckpointStore(state) as store:
+            counts = {stage: len(store.completed(stage)) for stage in STAGES}
+    roots = {
+        "track": config.storage.track_roots,
+        "temp": (config.storage.temp_root,),
+        "products": (config.storage.products_root,),
+        "evidence": config.storage.evidence_roots,
+    }
+    storage = []
+    for role, paths in roots.items():
+        for path in paths:
+            try:
+                free_gib: float | None = round(free_space_bytes(path) / GIB, 2)
+                availability = "available"
+            except OSError:
+                free_gib = None
+                availability = "unavailable"
+            storage.append(
+                {
+                    "role": role,
+                    "path": str(path),
+                    "availability": availability,
+                    "free_gib": free_gib,
+                    "used_by_pipeline_gib": round(directory_size(path) / GIB, 2),
+                    "reserve_gib": config.storage.reserves_gib[role if role != "track" else "tracks"],
+                }
+            )
     return {
-        "work_root": str(config.storage.work_root.resolve()),
-        "free_space_gb": round(free_space_gb, 2),
-        "minimum_free_space_gb": config.runtime.minimum_free_space_gb,
-        "runtime_profiles": {
-            "global": {
-                "threads": config.runtime.threads,
-                "memory_limit": config.runtime.memory_limit,
-            },
-            "bucket": {
-                "workers": config.runtime.bucket_workers,
-                "threads_per_worker": config.runtime.bucket_threads,
-                "memory_limit_per_worker": (
-                    config.runtime.bucket_memory_limit
-                ),
-                "temp_limit_gb_per_worker": (
-                    config.runtime.bucket_temp_limit_gb
-                ),
-            },
+        "pipeline_version": "2.0.0",
+        "track_partitions": config.layout.track_partitions,
+        "checkpoints": counts,
+        "storage": storage,
+        "outputs": {
+            "trajectory_intervals": str(config.storage.products_root / "trajectory_intervals"),
+            "port_calls": str(config.storage.products_root / "port_calls"),
+            "validation": str(config.storage.products_root / "validation"),
+            "state": str(state),
         },
-        "prepare_settings": {
-            "mmsi_buckets": config.prepare.mmsi_buckets,
-            "partition_write_max_open_files": (
-                config.prepare.partition_write_max_open_files
-            ),
-            "row_group_size": config.prepare.row_group_size,
-        },
-        "stages": stages,
-        "trajectory_intervals": str(
-            (config.storage.work_root / "outputs" / "trajectory_intervals").resolve()
-        ),
-        "validation_reports": str(
-            (config.storage.work_root / "outputs" / "validation").resolve()
-        ),
-        "static_vessels": str(
-            (config.storage.work_root / "stage02_static" / "vessels.parquet").resolve()
-        ),
     }
 
 
-def _run_stage(
-    function: Callable[[AppConfig, Path, bool], dict[str, Any]],
-    config: AppConfig,
-    force: bool,
-) -> dict[str, Any]:
-    return function(config, Path.cwd(), force)
+def _print_status(status: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return
+    print("ExtractAIS 2.0 status")
+    print(f"Track partitions: {status['track_partitions']}")
+    print("Checkpoints:")
+    for stage, count in status["checkpoints"].items():
+        print(f"  {stage:20s} {count}")
+    print("Storage:")
+    for row in status["storage"]:
+        free = (
+            f"{row['free_gib']:10.2f} GiB"
+            if row["free_gib"] is not None
+            else "unavailable   "
+        )
+        print(
+            f"  {row['role']:8s} free={free} "
+            f"used={row['used_by_pipeline_gib']:10.2f} GiB  {row['path']}"
+        )
+    print("Outputs:")
+    for name, path in status["outputs"].items():
+        print(f"  {name:20s} {path}")
+
+
+def _with_store(config: AppConfig, function: Callable[[CheckpointStore], None]) -> None:
+    with CheckpointStore(checkpoint_path(config)) as store:
+        function(store)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -164,55 +147,55 @@ def main(argv: Optional[list[str]] = None) -> None:
     config = load_config(args.config)
 
     if args.command == "status":
-        print(json.dumps(_status(config), ensure_ascii=False, indent=2))
+        _print_status(_status(config), args.json)
         return
-
     if args.command == "inventory":
-        inventory = _inventory(config, _paths(args.input_file))
-        summary = {
-            "files": len(inventory.files),
-            "total_size_bytes": inventory.total_size_bytes,
-            "missing_dates": len(inventory.missing_dates),
-            "duplicate_dates": inventory.duplicate_dates,
-            "manifest": str(
-                (config.storage.work_root / "manifests" / "input_inventory.json").resolve()
-            ),
-        }
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return
-
-    force = bool(getattr(args, "force", False))
-    if args.command in {"split", "run-all"}:
-        inventory = _inventory(config, _paths(getattr(args, "input_file", None)))
-        split_manifest = split_files(
-            config,
-            inventory.files,
-            project_root=Path.cwd(),
-            force=force,
-            limit_files=getattr(args, "limit_files", None),
-        )
-        if args.command == "split":
-            completed = sum(
-                record.get("status") == "complete"
-                for record in split_manifest["files"].values()
+        inventory, inventory_hash = _inventory(config)
+        print(
+            json.dumps(
+                {
+                    "files": len(inventory.files),
+                    "total_gib": round(inventory.total_size_bytes / GIB, 2),
+                    "missing_dates": len(inventory.missing_dates),
+                    "duplicate_dates": inventory.duplicate_dates,
+                    "signature": inventory_hash,
+                },
+                ensure_ascii=False,
+                indent=2,
             )
-            print(json.dumps({"completed_files": completed}, indent=2))
-            return
-
-    stage_functions = {
-        "prepare": prepare_data,
-        "stops": build_stops,
-        "ports": build_ports,
-        "calls": build_port_calls,
-        "intervals": build_intervals,
-        "validate": build_validation,
-    }
-    if args.command in stage_functions:
-        manifest = _run_stage(stage_functions[args.command], config, force)
-        print(json.dumps(_stage_summary(manifest), ensure_ascii=False, indent=2))
+        )
+        return
+    if args.command == "run-all":
+        run_pipeline(config, Path.cwd())
+        _print_status(_status(config), False)
         return
 
-    if args.command == "run-all":
-        for function in stage_functions.values():
-            _run_stage(function, config, force)
-        print(json.dumps(_status(config), ensure_ascii=False, indent=2))
+    inventory, inventory_hash = _inventory(config)
+    if args.command == "ingest":
+        _with_store(config, lambda store: ingest(config, inventory, store))
+    elif args.command == "tracks":
+        def tracks_stage(store: CheckpointStore) -> None:
+            if not tracks_are_complete(config, inventory_hash, store):
+                ingest(config, inventory, store)
+                build_tracks(config, inventory, inventory_hash, store)
+            cleanup_ingest_runs(config)
+        _with_store(config, tracks_stage)
+    elif args.command == "ports":
+        _with_store(config, lambda store: build_ports(config, store))
+    elif args.command == "geometry":
+        _with_store(config, lambda store: build_geometry(config, store))
+    elif args.command == "calls":
+        _with_store(config, lambda store: build_calls(config, store))
+    elif args.command == "intervals":
+        _with_store(config, lambda store: build_intervals(config, store))
+    elif args.command == "validate":
+        _with_store(config, lambda store: build_validation(config, store))
+    elif args.command == "cleanup-staging":
+        with CheckpointStore(checkpoint_path(config)) as store:
+            if not tracks_are_complete(config, inventory_hash, store):
+                raise RuntimeError("Refusing cleanup: canonical track partitions are incomplete")
+        cleanup_ingest_runs(config)
+    else:
+        raise AssertionError(args.command)
+
+    _print_status(_status(config), False)

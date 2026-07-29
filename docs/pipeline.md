@@ -1,96 +1,97 @@
-# ExtractAIS pipeline contract
+# ExtractAIS v2 processing contract
 
-## Execution model
+## Invariants
 
-The production archive contains daily CSV files under `2021/` and `2022/`, approximately 6.24 TB in total. DuckDB performs every row-level transformation and may spill to the configured work disk. Python only inventories files, divides work into bounded units and commits checkpoints.
+1. A raw daily CSV is parsed exactly once during ingest.
+2. Dynamic and static messages separate immediately after normalization.
+3. `track_partition_id = mix(mmsi) & (partition_count - 1)` is stable; one MMSI never crosses partitions.
+4. A partition is permanently assigned to one track root and one evidence root.
+5. One heavy worker runs per physical track disk. DuckDB thread, memory, and spill limits are explicit.
+6. Only an atomically renamed output plus a durable SQLite row is complete.
+7. Progress counts committed source bytes; heartbeats report uncommitted internal phases.
 
-Every heavy work unit runs in a fresh spawned operating-system process and follows the same transaction pattern:
+## Data flow
 
-1. Compare the input identity, stage-specific configuration hash and required output files with the manifest.
-2. Write to a sibling `.tmp` file or directory.
-3. Close DuckDB, return only compact statistics, and exit the worker process.
-4. Atomically replace the final output.
-5. Record the Git commit, worker PID, row counts where practical, elapsed time and completion timestamp.
+```mermaid
+flowchart LR
+  RAW["Daily raw CSV on E"] --> ING["Normalize once and split"]
+  ING --> DR["Sorted dynamic runs on F/G"]
+  ING --> SR["Static runs on H"]
+  DR --> TR["Canonical tracks on F/G"]
+  SR --> VS["Compact vessel static data"]
+  TR --> ST["Stop events"]
+  ST --> AN["Observed multi-circle anchors"]
+  WPI["WPI port catalog"] --> PG["Independent port groups"]
+  TR --> GE["Point-anchor geometry on E/I"]
+  AN --> GE
+  GE --> CA["Confirmed port calls"]
+  PG --> CA
+  CA --> IV["Annual trajectory intervals on H"]
+  IV --> VA["Validation evidence"]
+```
 
-An interrupted active unit restarts; completed units are skipped. Track preparation additionally checkpoints every committed hash shard inside a source bucket, so retry only rebuilds missing shards. Process exit is the resource boundary: it releases DuckDB native allocator state, caches, threads and handles that closing a connection alone may retain in a long-lived Python process. Result delivery has a bounded worker-exit wait, so interpreter shutdown cannot block the parent indefinitely. After the first worker failure, no new unit starts; already active units drain and commit before the original error is raised. Global units use one worker with the global thread/memory profile. Track-work-unit stages use one spawned worker on the production HDD with a bounded thread, memory and task-specific temporary-directory profile.
+## Stage semantics
 
-Before every incomplete work unit, the storage guard requires free bytes to cover the configured minimum reserve and a conservative estimate of the active output. Bucket scheduling also reserves every worker's maximum DuckDB temporary budget before launching another process. Manifests record source/output bytes, effective throughput and free bytes before and after each newly completed unit.
+### Ingest
 
-DuckDB's internal operator progress is disabled because it does not account reliably for blocking finalization and Parquet flushes. Parent progress bars derive ETA only from the full elapsed time of completed compatible units. They show `ETA calibrating` before a real sample exists and reduce assumed parallelism when fewer work units remain. Track preparation reports a separate monotonic fraction: source re-sharding advances from output-byte growth, and each shard advances at deduplication, conflict detection, sequencing and commit boundaries. Downstream stages inherit the smaller permanent work units and therefore commit progress frequently.
+All source fields are initially read as text. Sentinels become null, timestamps/MMSI/coordinates are typed, and invalid dynamic positions are excluded. The normalized relation is reused to write dynamic lane runs, static runs, and partition statistics. The relation is temporary and never duplicated as a permanent full daily copy.
 
-## Data stages
+### Canonical tracks
 
-### Stage 01: split
+Each of 1024 tasks reads only the sorted daily runs for its final partition. It performs the archive-wide MMSI/time ordering once, removes exact duplicates, retains same-time coordinate conflicts as evidence, computes sequence/gap/step/implied-speed flags, and writes canonical Parquet. Stop events and latest non-null static vessel attributes are produced inside the same bounded task. After all 1024 outputs are committed, daily ingest runs are deleted.
 
-Each CSV is parsed once with all raw columns initially treated as text. Sentinels are normalized, and rows are separated into dynamic message types 1/2/3/18/19/27 and static types 5/24. Dynamic validity requires timestamp, nine-digit MMSI and valid coordinates. Static validity requires timestamp and MMSI. The normalized daily table has one summary scan followed by two Parquet `COPY` operations; each `COPY` result supplies its valid-row count. The manifest records output bytes, compression ratio and free space after every completed day.
+### Anchors and groups
 
-Source `matchedPortName`, `label`, `sublabel`, `at_dock`, source and collection type remain evidence only. They never directly determine the computed state.
+Stop centroids are aggregated on a spatial grid. Cells require configured stop-event and distinct-vessel support. Qualified cells are matched to nearby WPI members and become observed anchor circles.
 
-### Stage 02 and 03: prepare tracks
+WPI ports within `group_distance_km` form connected components. Every member stays in `port_catalog`; the group records all member country/area values and `is_cross_border`. Anchor identity does not contain `port_group_id`, so group rules can change without recalculating point geometry.
 
-Static messages are reduced to one row per MMSI using the latest non-null value of each field, with first/last timestamps and message count retained.
+### Geometry and calls
 
-Dynamic Parquet is scanned once per month and physically partitioned by `mmsi % bucket_count`. One writer remains open for every bucket. A lower writer limit causes DuckDB to evict and recreate partition writers, multiplying a production month into thousands of small files; configuration validation therefore requires `partition_write_max_open_files >= mmsi_buckets`, and the completed month is rejected if its file count exceeds the bucket count. Row-group size, rather than writer eviction, bounds buffering.
+A coarse tile join narrows candidates, then Haversine distance determines every point-to-anchor candidate within the approach radius. The complete ranked candidate evidence is retained. Calls map anchor candidates through the current port catalog/groups and require an approach episode with entry evidence and an independently detected stop overlap.
 
-The 256 monthly partitions are coarse source buckets. A full-archive source bucket can reach 13.33 GiB compressed, which expands beyond an 80 GB DuckDB window-memory limit. Stage 03 therefore scans one source bucket once and partitions it by `hash(mmsi)`. The shard count is a power of two selected from compressed source size and per-thread memory, with a 512 MiB target, a minimum of 8 and a maximum of 64. A 13.33 GiB production bucket becomes 32 shards. Since the hash key is MMSI, a vessel's complete multi-year trajectory remains in exactly one shard.
+### Intervals
 
-Each permanent shard is built through three bounded queries with Parquet materialization between them: exact coordinate/time deduplication, same-time coordinate-conflict detection, and vessel sequencing with gap, distance and implied-speed flags. Closing the connection between queries releases blocking window state before the next sort. Every shard is atomically committed to its own `stage03_tracks/mmsi_bucket=NNNNN/part.parquet` file and recorded in a source-bucket checkpoint. Intermediate re-sharding, query outputs and DuckDB spill files exist only in the active source bucket's deterministic temporary directory. Stage 04 onward consumes these permanent shards directly rather than recombining them into large files.
+Each point receives its previous and next confirmed call. Classification precedence is:
 
-The stage-03 layout marker is versioned independently from the monthly/static preparation hash. Moving from the legacy large-bucket layout removes old stage-03 tracks and every downstream artifact or manifest that depends on the old physical IDs. Completed split outputs, monthly partitions and the compact static table remain valid. This prevents unmatched legacy bucket files from entering a new global port or validation scan. Partition manifests retain compressed input/output bytes, output file count, rows, effective MiB/s and storage-budget observations.
-
-### Stage 04: stop events
-
-A stop candidate is a low-speed point or a point with missing speed and a sufficiently short step. Consecutive candidates are split on the configured point gap. A run is retained only if its duration and bounding-box diameter satisfy the stop thresholds. The event retains its centroid, extent, speed statistics, point count and source `at_dock` support.
-
-### Stage 05: ports and anchors
-
-WPI rows with invalid coordinates or an excluded Harbor Size are removed. Port centers separated by no more than `group_distance_km` are unioned through connected components. Every member remains in `port_catalog`; recognition outputs the shared `port_group_id`.
-
-Stop centroids are aggregated on the anchor grid. Cells must meet minimum stop-event and distinct-vessel support. Each qualified cell is assigned to the nearest WPI member within `anchor_assignment_radius_km`. The assigned cells become multi-circle anchor centers. Stops within the entry radius of an anchor form independent port-call evidence. This stop-to-port matching is written and resumed per permanent track work unit rather than materialized as one global table.
-
-A 0.1-degree lookup table maps AIS `geo_tile` values to possible anchors. Exact Haversine distance is always applied after the coarse join.
-
-### Stage 06: candidates and port calls
-
-For each near-port point, the minimum exact distance to every candidate port group is retained and ranked. A compact one-row-per-point context stores the first and second candidate, both distances and the ambiguity margin so downstream queries do not repeat the rank-one/rank-two self-join. Consecutive rank-one points for the same group form an approach episode; missing points, group changes and excessive point gaps split episodes.
-
-An episode becomes a confirmed port call only when it:
-
-- has at least the configured number of points;
-- reaches the entry radius and has an exit-radius observation; and
-- overlaps an independently detected and port-matched stop event.
-
-The candidate and port-call files preserve source labels, distance margins and evidence counts for audit. Source `at_dock` and port labels do not confirm a call, so they remain independent comparison evidence.
-
-### Final states and annual intervals
-
-Each valid track point is attached to its most recent and next confirmed port call using temporal ASOF joins. Classification precedence is:
-
-1. Between a confirmed call's entry and exit: `IN_PORT`.
-2. Within the approach radius of the previous call: `DEPARTING`.
-3. Within the approach radius of the next call: `ARRIVING`.
+1. Inside a confirmed call window: `IN_PORT`.
+2. Near the previous confirmed group: `DEPARTING`.
+3. Near the next confirmed group: `ARRIVING`.
 4. Otherwise: `OCEAN`.
 
-If previous and next approach zones both contain the point, the nearer group determines the direction. Consecutive equal state/from/to points are compressed. Gaps above the configured threshold are emitted separately as `UNKNOWN_GAP`. Segments crossing January 1 are clipped into separate annual rows. Each track-work-unit worker writes its annual files directly to `outputs/trajectory_intervals/year=YYYY`; there is no duplicate global annual-export scan or persistent stage-07 copy.
+Observation gaps above `unknown_gap_hours` are explicit `UNKNOWN_GAP` rows. Consecutive points with equal state/from/to context are compressed into one interval. Cross-year intervals are clipped to annual outputs.
 
-The output intentionally excludes endpoint coordinates, duration and route distance.
+## Dependency invalidation
+
+| Change | Earliest rebuilt stage |
+|---|---|
+| Raw CSV identity, message types, partition count | `ingest` |
+| Deduplication, speed or stop rules | `tracks` |
+| Anchor grid/support/assignment | `ports` anchors |
+| Entry or approach radius | `geometry` |
+| Exit radius | `calls` |
+| Port grouping or excluded harbor size | `port_groups`, then calls |
+| Call confirmation rules | `calls` |
+| Unknown-gap threshold | `intervals` |
+
+Signatures propagate through dependency file identities. Geometry depends on anchors and radii, not port groups; this is the key boundary that makes port-group iteration inexpensive.
+
+## Storage lifecycle
+
+Permanent: canonical tracks, compact vessel static data, stop events, port/anchor catalogs, geometry evidence, port calls, trajectory intervals, validation reports, input inventory, and `state.sqlite`.
+
+Temporary: DuckDB spill directories, heartbeat JSON, `.tmp.parquet`, and ingest sorted runs. Temporary files are scoped to one task. A successful full pipeline removes the temp root; ingest runs are removed only after all tracks validate.
 
 ## Validation contract
 
-The following evidence must remain available before any Harbor Size is excluded:
+Before excluding small ports, retain and compare:
 
-- port-group membership and member count;
-- anchor location, stop-event support, vessel support and WPI-center distance;
-- qualified but unmatched stop-anchor candidates;
-- every near-port candidate group and exact distance rank;
-- first/second candidate margin;
-- matched stop count and source-label support for each call;
-- port-level call count, calling-vessel count and ambiguity rate;
-- Harbor Size-stratified coverage and quality;
-- annual state and quality-flag counts.
+- WPI group membership, country/area membership, cross-border flag, and Harbor Size;
+- anchor support, vessel support, nearest WPI distance, and unmatched qualified cells;
+- every point-to-anchor and point-to-group candidate distance;
+- first/second candidate margin and ambiguity flag;
+- call entry/exit/stop evidence;
+- port and Harbor Size coverage, calling vessels, and ambiguity rates;
+- interval state and quality-flag counts.
 
-`Very Small` removal is a catalog-configuration change. It invalidates stages 05 onward but does not invalidate CSV parsing, static compaction, track preparation or stop detection.
-
-## Known first-version boundary
-
-AIS gaps longer than the threshold are never inferred. Short gaps may remain inside an observed event, but the pipeline does not yet probabilistically reconstruct missing positions or visits. This keeps first-version labels auditable and provides a clean base for a later inference stage.
+AIS gaps are not inferred in v2. Long gaps are always `UNKNOWN_GAP`, preserving an auditable base for a separate future inference model.

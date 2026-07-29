@@ -1,69 +1,66 @@
 from __future__ import annotations
 
-import statistics
-from collections import deque
-
-
-HONEST_BAR_FORMAT = (
-    "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
-    "[{elapsed}, {postfix}]"
-)
-FRACTIONAL_BAR_FORMAT = (
-    "{desc}: {percentage:6.2f}%|{bar}| [{elapsed}, {postfix}]"
-)
-
-
-def advance_progress_to(progress, value: float) -> None:
-    """Advance a tqdm-compatible progress object without moving backwards."""
-    bounded = min(float(progress.total), max(float(progress.n), float(value)))
-    if bounded > float(progress.n):
-        progress.n = bounded
-        progress.refresh()
+import time
+from dataclasses import dataclass, field
 
 
 def format_duration(seconds: float) -> str:
-    total = max(0, int(round(seconds)))
-    hours, remainder = divmod(total, 3600)
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-class ProgressEstimator:
-    def __init__(self, max_workers: int, sample_window: int = 12) -> None:
-        if max_workers <= 0:
-            raise ValueError("max_workers must be positive")
-        self.max_workers = max_workers
-        self._rates: deque[float] = deque(maxlen=sample_window)
+@dataclass
+class StageProgress:
+    name: str
+    total_bytes: int
+    total_tasks: int
+    completed_bytes: int = 0
+    completed_tasks: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+    active: dict[str, tuple[str, float]] = field(default_factory=dict)
+    samples: list[tuple[int, float]] = field(default_factory=list)
 
-    def add_sample(self, source_bytes: int, elapsed_seconds: float) -> None:
+    @property
+    def percent(self) -> float:
+        if self.total_bytes > 0:
+            return min(100.0, self.completed_bytes * 100.0 / self.total_bytes)
+        if self.total_tasks > 0:
+            return min(100.0, self.completed_tasks * 100.0 / self.total_tasks)
+        return 100.0
+
+    def start(self, task_key: str, source_bytes: int, phase: str = "starting") -> None:
+        self.active[task_key] = (phase, time.monotonic())
+
+    def phase(self, task_key: str, phase: str) -> None:
+        started = self.active.get(task_key, (phase, time.monotonic()))[1]
+        self.active[task_key] = (phase, started)
+
+    def complete(self, task_key: str, source_bytes: int, elapsed_seconds: float) -> None:
+        self.active.pop(task_key, None)
+        self.completed_bytes += max(0, int(source_bytes))
+        self.completed_tasks += 1
         if source_bytes > 0 and elapsed_seconds > 0:
-            self._rates.append(source_bytes / elapsed_seconds)
+            self.samples.append((int(source_bytes), float(elapsed_seconds)))
 
-    @property
-    def has_samples(self) -> bool:
-        return bool(self._rates)
+    def _eta(self) -> str:
+        if len(self.samples) < 3:
+            return f"ETA calibrating {len(self.samples)}/3"
+        bytes_done = sum(item[0] for item in self.samples[-32:])
+        elapsed = sum(item[1] for item in self.samples[-32:])
+        remaining = max(0, self.total_bytes - self.completed_bytes)
+        if bytes_done <= 0:
+            return "ETA unavailable"
+        return f"ETA {format_duration(remaining * elapsed / bytes_done)}"
 
-    @property
-    def aggregate_bytes_per_second(self) -> float | None:
-        if not self._rates:
-            return None
-        return statistics.median(self._rates) * self.max_workers
-
-    def estimate_seconds(
-        self, remaining_bytes: int, worker_count: int | None = None
-    ) -> float | None:
-        if not self._rates:
-            return None
-        effective_workers = self.max_workers
-        if worker_count is not None:
-            effective_workers = max(1, min(self.max_workers, worker_count))
-        rate = statistics.median(self._rates) * effective_workers
-        return max(0, remaining_bytes) / rate
-
-    def format_eta(
-        self, remaining_bytes: int, worker_count: int | None = None
-    ) -> str:
-        seconds = self.estimate_seconds(remaining_bytes, worker_count)
-        if seconds is None:
-            return "ETA calibrating"
-        return f"ETA {format_duration(seconds)}"
+    def render(self) -> str:
+        active = ",".join(
+            f"{key}:{phase}" for key, (phase, _) in sorted(self.active.items())
+        ) or "-"
+        return (
+            f"{self.name} {self.percent:6.2f}% "
+            f"{self.completed_tasks}/{self.total_tasks} "
+            f"active={active} elapsed={format_duration(time.monotonic() - self.started_at)} "
+            f"{self._eta()}"
+        )
