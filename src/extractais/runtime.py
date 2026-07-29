@@ -136,6 +136,13 @@ def run_stage_tasks(
         bar.set_postfix_str(progress.render().split("active=", 1)[1])
         bar.refresh()
 
+    def native_retry(call: IsolatedCall, exit_code: int) -> None:
+        description = call.fallback_description or "safe execution profile"
+        bar.write(
+            f"{stage}: task {call.key} exited natively with "
+            f"0x{exit_code & 0xFFFFFFFF:08X}; retrying with {description}"
+        )
+
     try:
         for result in run_isolated_many(
             [task.call for task in pending],
@@ -143,6 +150,7 @@ def run_stage_tasks(
             poll_interval_seconds=config.runtime.progress_interval_seconds,
             on_poll=poll,
             before_start=before_start,
+            on_native_retry=native_retry,
         ):
             task = by_key[result.key]
             output_bytes, row_count = complete(

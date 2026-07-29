@@ -13,7 +13,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-版本必须是 `2.0.0`。已有环境升级：
+版本必须是 `2.0.1`。已有环境升级：
 
 ```powershell
 git pull origin main
@@ -106,6 +106,7 @@ tracks: 18%|...| 146G/812G [03:10:22, active=0042:sorting ETA 14:21:08]
 - ETA 至少完成 3 个工作单元后才显示；此前显示 `ETA calibrating n/3`。
 - ETA 基于已提交工作单元的实际字节吞吐，不使用“首个任务瞬间完成”造成的虚假速度。
 - 一个分区可能运行较久，百分比只在它提交后跳动，这是提交语义，不是停滞。
+- 某日并行 CSV reader 若被 Windows 原生层终止，该日会自动使用显式 schema 的单线程 reader 重试一次；已完成日期不会重算，解析规则不变。
 
 可随时 `Ctrl+C` 停止，再执行同一命令。`state.sqlite` 同时验证参数签名和输出文件存在性；未提交的 `.tmp` 不会被当成成功结果。查看状态：
 

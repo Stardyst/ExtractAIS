@@ -36,6 +36,7 @@ def _ingest_worker(
     date: str,
     outputs: tuple[Path, ...],
     heartbeat_path: Path,
+    safe_mode: bool = False,
 ) -> dict[str, int]:
     lane_count = len(config.storage.track_roots)
     dynamic_outputs = outputs[:lane_count]
@@ -68,11 +69,22 @@ def _ingest_worker(
         f"ingest {date} static output",
     )
 
-    connection = open_database(config, worker_temp, worker=True)
+    connection = open_database(
+        config,
+        worker_temp,
+        worker=True,
+        threads_override=1 if safe_mode else None,
+    )
     try:
-        heartbeat(heartbeat_path, "parsing raw CSV")
+        heartbeat(
+            heartbeat_path,
+            "parsing raw CSV (safe single-thread reader)"
+            if safe_mode
+            else "parsing raw CSV",
+        )
         connection.execute(
-            f"CREATE TEMP TABLE normalized_day AS {normalized_day_sql(source)}"
+            f"CREATE TEMP TABLE normalized_day AS "
+            f"{normalized_day_sql(source, safe_mode=safe_mode)}"
         )
         dynamic_sql = DYNAMIC_SELECT.format(
             dynamic_types=sql_int_list(list(config.cleaning.dynamic_message_types))
@@ -180,8 +192,17 @@ def ingest(config: AppConfig, inventory: Inventory, store: CheckpointStore) -> N
                 call=IsolatedCall(
                     key=item.date,
                     target=_ingest_worker,
-                    args=(config, source, item.date, outputs, heartbeat_path),
+                    args=(config, source, item.date, outputs, heartbeat_path, False),
                     resource="raw-input",
+                    fallback_args=(
+                        config,
+                        source,
+                        item.date,
+                        outputs,
+                        heartbeat_path,
+                        True,
+                    ),
+                    fallback_description="safe single-thread CSV reader",
                 ),
             )
         )

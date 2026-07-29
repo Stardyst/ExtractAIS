@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from extractais.config import load_config
+from extractais.isolated import IsolatedCall, run_isolated_many
 from extractais.pipeline import run_pipeline
+from extractais.schema import normalized_day_sql
 from extractais.storage import ensure_space
 from test_v2_contract import _config, _ports, _raw_track
+
+
+def _native_crash_then_succeed(sentinel: Path, safe_mode: bool) -> str:
+    if not safe_mode:
+        sentinel.write_text("crashed", encoding="ascii")
+        os._exit(9)
+    return "safe"
+
+
+def _native_crash() -> None:
+    os._exit(9)
 
 
 def _sample(tmp_path: Path):
@@ -86,3 +101,61 @@ def test_storage_guard_checks_reserve_plus_next_output(tmp_path: Path) -> None:
     free = __import__("shutil").disk_usage(tmp_path).free
     with pytest.raises(RuntimeError, match="Storage guard stopped"):
         ensure_space(tmp_path, free / 1024**3, 1, "test task")
+
+
+def test_native_worker_crash_retries_same_task_with_safe_arguments(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "native-crash"
+    results = list(
+        run_isolated_many(
+            [
+                IsolatedCall(
+                    key="2021-04-07",
+                    target=_native_crash_then_succeed,
+                    args=(sentinel, False),
+                    fallback_args=(sentinel, True),
+                    fallback_description="safe CSV reader",
+                )
+            ],
+            max_workers=1,
+            poll_interval_seconds=0.05,
+        )
+    )
+    assert sentinel.exists()
+    assert results[0].value == "safe"
+
+
+def test_native_worker_crash_reports_task_and_hex_exit_code() -> None:
+    with pytest.raises(
+        RuntimeError, match=r"2021-04-07.*0x00000009.*without a result"
+    ):
+        list(
+            run_isolated_many(
+                [IsolatedCall(key="2021-04-07", target=_native_crash)],
+                max_workers=1,
+                poll_interval_seconds=0.05,
+            )
+        )
+
+
+def test_safe_csv_sql_has_explicit_schema_and_disables_parallel_reader(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw.csv"
+    _raw_track(raw)
+    sql = normalized_day_sql(raw, safe_mode=True)
+    assert "columns = {" in sql
+    assert "auto_detect = false" in sql
+    assert "parallel = false" in sql
+    assert "rejects_limit = 10000" in sql
+    connection = duckdb.connect()
+    try:
+        safe_rows = connection.execute(f"SELECT count(*) FROM ({sql})").fetchone()[0]
+        fast_rows = connection.execute(
+            f"SELECT count(*) FROM ({normalized_day_sql(raw)})"
+        ).fetchone()[0]
+        assert safe_rows == fast_rows
+        assert safe_rows > 0
+    finally:
+        connection.close()

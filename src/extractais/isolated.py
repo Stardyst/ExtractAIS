@@ -22,6 +22,9 @@ class IsolatedCall:
     args: tuple = ()
     kwargs: dict | None = None
     resource: str | None = None
+    fallback_args: tuple | None = None
+    fallback_kwargs: dict | None = None
+    fallback_description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,7 @@ def run_isolated_many(
         [IsolatedCall, Mapping[str, ActiveProcess]], None
     ]
     | None = None,
+    on_native_retry: Callable[[IsolatedCall, int], None] | None = None,
 ) -> Iterator[IsolatedTaskResult]:
     if max_workers <= 0:
         raise ValueError("max_workers must be positive")
@@ -172,6 +176,7 @@ def run_isolated_many(
                     "started": started,
                     "phase": "running",
                     "resource": call.resource,
+                    "call": call,
                 }
 
             if on_poll is not None:
@@ -235,11 +240,33 @@ def run_isolated_many(
                         active.pop(key, None)
 
                 if payload is None:
+                    call = state["call"]
+                    exit_code = int(process.exitcode or 0)
+                    if exit_code != 0 and call.fallback_args is not None:
+                        if on_native_retry is not None:
+                            on_native_retry(call, exit_code)
+                        pending.insert(
+                            0,
+                            IsolatedCall(
+                                key=call.key,
+                                target=call.target,
+                                args=call.fallback_args,
+                                kwargs=(
+                                    call.fallback_kwargs
+                                    if call.fallback_kwargs is not None
+                                    else call.kwargs
+                                ),
+                                resource=call.resource,
+                            ),
+                        )
+                        continue
                     failures.append(
                         {
+                            "task_key": key,
                             "process_id": process.pid,
                             "error": (
-                                f"Worker exited with code {process.exitcode} "
+                                f"Worker exited with code {exit_code} "
+                                f"(0x{exit_code & 0xFFFFFFFF:08X}) "
                                 "without a result"
                             ),
                             "traceback": "",
@@ -248,6 +275,7 @@ def run_isolated_many(
                     pending.clear()
                     continue
                 if not payload["ok"]:
+                    payload["task_key"] = key
                     failures.append(payload)
                     pending.clear()
                     continue
@@ -260,7 +288,7 @@ def run_isolated_many(
         if failures:
             failure = failures[0]
             raise RuntimeError(
-                f"Worker {failure['process_id']} failed: "
+                f"Task {failure['task_key']} worker {failure['process_id']} failed: "
                 f"{failure['error']}\n{failure['traceback']}"
             )
     except BaseException:

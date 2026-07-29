@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 
+from extractais import __version__
 from extractais.calls import build_calls
 from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig, load_config
@@ -99,7 +100,7 @@ def _status(config: AppConfig) -> dict[str, object]:
                 }
             )
     return {
-        "pipeline_version": "2.0.0",
+        "pipeline_version": __version__,
         "track_partitions": config.layout.track_partitions,
         "checkpoints": counts,
         "storage": storage,

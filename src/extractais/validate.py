@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from extractais import __version__
 from extractais.calls import group_candidate_path
 from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig
@@ -359,7 +360,7 @@ def build_validation(config: AppConfig, store: CheckpointStore) -> None:
     )
 
     summary = {
-        "pipeline_version": "2.0.0",
+        "pipeline_version": __version__,
         "track_partitions": config.layout.track_partitions,
         "years": sorted(config.input.year_directories),
         "trajectory_intervals": str((config.storage.products_root / "trajectory_intervals").resolve()),

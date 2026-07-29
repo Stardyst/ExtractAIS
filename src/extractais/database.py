@@ -16,9 +16,14 @@ def open_database(
     temp_directory: Path,
     *,
     worker: bool,
+    threads_override: int | None = None,
 ) -> duckdb.DuckDBPyConnection:
     temp_directory.mkdir(parents=True, exist_ok=True)
     threads = config.runtime.worker_threads if worker else config.runtime.global_threads
+    if threads_override is not None:
+        if threads_override <= 0:
+            raise ValueError("threads_override must be positive")
+        threads = min(threads, threads_override)
     memory = config.runtime.worker_memory if worker else config.runtime.global_memory
     temp_limit = (
         config.runtime.worker_temp_gib
