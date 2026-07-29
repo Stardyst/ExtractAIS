@@ -466,31 +466,39 @@ def _write_stop_port_matches_bucket(
         WHERE match_rank = 1
     """
     temporary = temporary_file(output)
+    bucket = int(stop_path.parent.name.split("=", 1)[1])
+    worker_temp = (
+        config.storage.temp_directory
+        / f"port-matches-bucket-{bucket:04d}"
+    )
+    remove_path(worker_temp, config.storage.temp_directory)
     temporary.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = open_database(
-        config,
-        output_reserve_bytes=stop_path.stat().st_size,
-        workload="bucket",
-    )
     try:
-        count = int(
-            connection.execute(
-                parquet_copy_sql(
-                    select_sql,
-                    temporary,
-                    config.prepare.compression,
-                    config.prepare.row_group_size,
-                )
-            ).fetchone()[0]
+        connection = open_database(
+            config,
+            output_reserve_bytes=stop_path.stat().st_size,
+            workload="bucket",
+            worker_temp_directory=worker_temp,
         )
-    finally:
-        connection.close()
-    try:
+        try:
+            count = int(
+                connection.execute(
+                    parquet_copy_sql(
+                        select_sql,
+                        temporary,
+                        config.prepare.compression,
+                        config.prepare.row_group_size,
+                    )
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
         replace_file(temporary, output)
         return count
     finally:
         temporary.unlink(missing_ok=True)
+        remove_path(worker_temp, config.storage.temp_directory)
 
 
 def build_ports(

@@ -269,12 +269,17 @@ def _write_interval_bucket_worker(
     calls_path: Path,
     temporary_root: Path,
 ) -> Dict[str, Any]:
-    connection = open_database(
-        config,
-        output_reserve_bytes=track_path.stat().st_size,
-        workload="bucket",
-    )
+    worker_temp = temporary_root / "duckdb"
+    remove_path(worker_temp, temporary_root)
+    connection = None
+    completed = False
     try:
+        connection = open_database(
+            config,
+            output_reserve_bytes=track_path.stat().st_size,
+            workload="bucket",
+            worker_temp_directory=worker_temp,
+        )
         select_sql = _interval_select_sql(
             config,
             track_path,
@@ -302,12 +307,17 @@ def _write_interval_bucket_worker(
                     )
                 ).fetchone()[0]
             )
+        completed = True
         return {
             "year_counts": counts,
             "interval_count": sum(counts.values()),
         }
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
+        remove_path(worker_temp, temporary_root)
+        if not completed:
+            remove_path(temporary_root, config.storage.work_root)
 
 
 def build_intervals(

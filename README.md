@@ -22,7 +22,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-当前版本应显示 `1.4.1`。
+当前版本应显示 `1.5.0`。
 
 ## 2. 准备生产配置
 
@@ -53,15 +53,15 @@ storage:
 runtime:
   threads: 20
   memory_limit: "90GB"
-  bucket_workers: 2
-  bucket_threads: 10
-  bucket_memory_limit: "42GB"
+  bucket_workers: 1
+  bucket_threads: 8
+  bucket_memory_limit: "80GB"
   bucket_temp_limit_gb: 256
   enable_progress: true
   minimum_free_space_gb: 500
 ```
 
-月度分区、静态表、全局港口锚点和验证报告使用全局档位；MMSI 分桶排序、停留、停留到港口匹配、港口调用和区间构建使用两个并发桶工人。单 HDD 不建议继续增加 `bucket_workers`，否则随机读写和磁头寻道通常会抵消并行收益。旧配置缺少上述资源字段时会采用这里的默认值，`status` 不再因缺少 `threads` 报错。
+月度分区、静态表、全局港口锚点和验证报告使用全局档位；MMSI 分桶排序、停留、停留到港口匹配、港口调用和区间构建使用一个桶工人。生产轨迹桶实测最大约为平均值的 4.1 倍，单个 42 GB 工人在多窗口排序中会触及 DuckDB 内存上限；80 GB 档位约占 128 GiB 物理内存的 58%，并为系统和 DuckDB 非缓冲区分配保留空间。单 HDD 不应增加 `bucket_workers`，否则会重新引入内存竞争和随机 I/O。旧配置缺少资源字段时采用这里的默认值。
 
 生产配置还必须为每个 MMSI 桶保留一个月度分区写入器：
 
@@ -148,6 +148,8 @@ extractais --config configs/production.yaml run-all
 - 已完成的日、月或 MMSI 桶直接跳过。
 - 正在执行但尚未完成的最小工作单元会从头重算。
 - 每个重型工作单元在独立操作系统子进程中运行；单元结束后进程退出，DuckDB 原生分配器、缓存、线程和句柄由操作系统整体回收。
+- 子进程返回成功结果后只等待有限时间退出；解释器清理不会再让主进度永久卡在 `worker shutdown`。
+- 一个桶失败后停止派发新桶，但允许已经运行的桶完成并提交，再报告原始错误。
 - 最终文件先写为临时产物，成功后再原子替换；中断不会把半个 Parquet 标记为完成。
 - 检查点位于 `derived/manifests/*.json`，包含输入身份、阶段参数哈希、Git commit、子进程 PID、耗时和输出路径。
 - `--force` 会重建该命令所有已完成工作单元，只在确认需要重算时使用。
@@ -166,7 +168,7 @@ python -c "import extractais; print(extractais.__version__)"
 extractais --config configs/production.yaml status
 ```
 
-版本应为 `1.4.1`。不需要删除 `derived`，也不要加 `--force`。旧 `configs/production.yaml` 即使缺少新资源字段也能加载；建议按第 2 节补齐字段，让实际资源配置可审计。若配置中仍是 `partition_write_max_open_files: 100`，必须先改为 `256`。
+版本应为 `1.5.0`。不需要删除 `derived`，也不要加 `--force`。`configs/production.yaml` 不受 Git 管理，因此从旧版升级时必须手工确认 `bucket_workers: 1`、`bucket_threads: 8` 和 `bucket_memory_limit: "80GB"`。若配置中仍是 `partition_write_max_open_files: 100`，也必须改为 `256`。
 
 当前是在 `prepare` 中途暂停时，继续执行：
 
@@ -174,7 +176,22 @@ extractais --config configs/production.yaml status
 extractais --config configs/production.yaml prepare
 ```
 
-已经提交的月份和桶保持有效；暂停时尚未提交的最小工作单元会重算。不要在同一份 `derived` 中改变 `prepare.mmsi_buckets`；若当前已使用 256，应继续保持 256。新版从 `stops` 开始采用双桶并发，`ports` 会补建分桶停留匹配，`calls` 会补建紧凑港口上下文，`intervals` 会直接生成最终年度文件，因此后续旧检查点若缺少新产物会自动重算。
+已经提交的月份、静态表和轨迹桶保持有效；失败时正在处理且尚未提交的桶会重算。不要在同一份 `derived` 中改变 `prepare.mmsi_buckets`；若当前已使用 256，应继续保持 256。轨迹桶现在依次物化精确去重、同时间冲突和序列计算，避免多个阻塞窗口同时占满内存。后续桶阶段也使用任务级临时目录，重试会先清理该任务残留。
+
+旧版异常退出可能在 `derived/tmp/worker-*` 留下临时文件。只有在确认没有 ExtractAIS 进程运行后，才执行一次清理：
+
+```powershell
+$running = Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -match "extractais" }
+if ($running) { throw "ExtractAIS is still running; temporary files were not removed." }
+
+$tempRoot = (Resolve-Path "E:/AIS2021-2022/derived/tmp").Path
+Get-ChildItem -LiteralPath $tempRoot -Directory -Filter "worker-*" |
+  Where-Object { $_.FullName.StartsWith($tempRoot + [IO.Path]::DirectorySeparatorChar) } |
+  Remove-Item -Recurse -Force
+```
+
+新版桶任务不再依赖 PID 临时目录；中断后的同一桶重试会清理自己的确定性目录。
 
 ## 7. 输出位置
 
@@ -285,12 +302,12 @@ extractais --config configs/production.yaml validate
 - 第一个月尚未提交时，进度条每 30 秒更新临时输出 GiB 和文件数。月度提交前还会强制检查文件数不得超过 MMSI 桶数。
 - DuckDB 内部进度条已关闭，因为其算子百分比不包含阻塞算子的收尾、Parquet flush 和文件替换，曾把剩余时间低估到实际值的约四分之一。
 - 主进度条只使用已经完整提交的相同工作单元计算 ETA。没有实测样本时显示 `ETA calibrating`；随后采用最近 12 个单元的中位吞吐率，并在尾部按实际剩余工人数修正。该 ETA 包含完整查询和输出收尾时间，不使用当前 DuckDB 算子百分比。
-- 桶阶段显示两个活动桶、已提交桶数、实测 MiB/s、ETA 和剩余 TiB。`prepare` 排序、`stops`、停留匹配、`calls`、`intervals` 均使用相同调度器。
+- 桶阶段显示活动桶、当前处理子阶段、已提交桶数、实测 MiB/s、ETA 和剩余 TiB。`prepare` 排序、`stops`、停留匹配、`calls`、`intervals` 均使用相同调度器。
 - 动态分桶按月只扫描一次，不会为 256 个桶重复扫描全年数据。
 - 停留到港口匹配按 MMSI 桶保存，不再生成一个全局匹配大表；港口调用生成一次紧凑 `port_context`，区间和验证复用它；区间直接写最终年度文件，不再保留并再次扫描一份 `stage07_intervals`。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。
 - `temp_directory` 必须和 `work_root` 位于容量充足的工作盘；不要指向系统盘。
-- 全局任务要求 `free >= minimum_free_space + estimated_output`。桶任务还会预留 `bucket_workers * bucket_temp_limit_gb` 和所有活动桶的预计输出；默认配置仅这两项固定预留即为 `500 + 2 * 256 = 1012 GiB`。不满足时会在启动下一个子进程前报 `Storage guard stopped`，已提交检查点不受损。
+- 全局任务要求 `free >= minimum_free_space + estimated_output`。桶任务还会预留 `bucket_workers * bucket_temp_limit_gb` 和活动桶的预计输出；默认固定预留为 `500 + 1 * 256 = 756 GiB`。不满足时会在启动下一个子进程前报 `Storage guard stopped`，已提交检查点不受损。
 - 不要手工删除阶段目录后再执行 `run-all`。当前版本把中间产物视为可复现检查点，删除后会按依赖关系重建。
 
 当前生产盘前 37 天的实测数据为：309.72 GiB CSV 生成 45.63 GiB 动态 Parquet 和 5.38 GiB 静态 Parquet，`split` 压缩率为 16.47%，据此估计完整 `split` 约 1.03 TiB。后续候选港口规模依赖真实近港密度，不能仅由 CSV 压缩率可靠外推；应以每阶段 manifest 的 `source_bytes`、`output_bytes` 和空间保护结果为准。

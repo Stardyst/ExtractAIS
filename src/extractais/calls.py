@@ -239,12 +239,17 @@ def _write_port_call_bucket(
     temporary_candidates = temporary_root / "candidates.parquet"
     temporary_context = temporary_root / "port_context.parquet"
     temporary_calls = temporary_root / "port_calls.parquet"
-    connection = open_database(
-        config,
-        output_reserve_bytes=track_path.stat().st_size * 4,
-        workload="bucket",
-    )
+    worker_temp = temporary_root / "duckdb"
+    remove_path(worker_temp, temporary_root)
+    connection = None
+    completed = False
     try:
+        connection = open_database(
+            config,
+            output_reserve_bytes=track_path.stat().st_size * 4,
+            workload="bucket",
+            worker_temp_directory=worker_temp,
+        )
         candidate_count = _write_candidates(
             connection,
             config,
@@ -264,13 +269,18 @@ def _write_port_call_bucket(
             stop_matches_path,
             temporary_calls,
         )
+        completed = True
         return {
             "candidate_count": candidate_count,
             "context_count": context_count,
             "port_call_count": call_count,
         }
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
+        remove_path(worker_temp, temporary_root)
+        if not completed:
+            remove_path(temporary_root, config.storage.work_root)
 
 
 def build_port_calls(

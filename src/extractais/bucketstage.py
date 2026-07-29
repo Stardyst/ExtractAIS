@@ -70,10 +70,19 @@ def run_bucket_stage(
         )
 
     def on_poll(active) -> None:
-        labels = ",".join(task_by_key[key].label for key in sorted(active))
+        labels = ",".join(
+            (
+                task_by_key[key].label
+                if active[key].phase == "running"
+                else f"{task_by_key[key].label}:{active[key].phase}"
+            )
+            for key in sorted(active)
+        )
+        free_tib = free_space_bytes(config.storage.work_root) / TIB
         progress.set_postfix_str(
             f"active={labels or '-'} "
-            f"{estimator.format_eta(remaining_bytes, remaining_count)}"
+            f"{estimator.format_eta(remaining_bytes, remaining_count)} "
+            f"free={free_tib:.2f}TiB"
         )
         progress.refresh()
 

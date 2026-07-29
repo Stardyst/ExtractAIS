@@ -148,10 +148,10 @@ def load_config(path: Path) -> AppConfig:
         runtime=RuntimeConfig(
             threads=int(runtime_raw.get("threads", 20)),
             memory_limit=str(runtime_raw.get("memory_limit", "90GB")),
-            bucket_workers=int(runtime_raw.get("bucket_workers", 2)),
-            bucket_threads=int(runtime_raw.get("bucket_threads", 10)),
+            bucket_workers=int(runtime_raw.get("bucket_workers", 1)),
+            bucket_threads=int(runtime_raw.get("bucket_threads", 8)),
             bucket_memory_limit=str(
-                runtime_raw.get("bucket_memory_limit", "42GB")
+                runtime_raw.get("bucket_memory_limit", "80GB")
             ),
             bucket_temp_limit_gb=float(
                 runtime_raw.get("bucket_temp_limit_gb", 256)

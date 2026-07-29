@@ -153,94 +153,170 @@ def _bucket_files(partition_root: Path) -> Dict[int, list[Path]]:
     return {bucket: sorted(paths) for bucket, paths in result.items()}
 
 
-def _write_track_bucket(
-    config: AppConfig, paths: list[Path], bucket: int, output: Path
+def _copy_track_phase(
+    config: AppConfig,
+    select_sql: str,
+    output: Path,
+    output_reserve_bytes: int,
+    duckdb_temp: Path,
 ) -> int:
-    source = parquet_sources(paths)
-    output_reserve_bytes = total_file_size(paths) * 2
-    distance = haversine_km("prev_latitude", "prev_longitude", "latitude", "longitude")
-    select_sql = f"""
-        WITH ranked AS (
-            SELECT
-                *,
-                row_number() OVER (
-                    PARTITION BY mmsi, timestamp_utc, latitude, longitude
-                    ORDER BY source_at_dock DESC NULLS LAST, msg_type, msg_id NULLS LAST
-                ) AS exact_rank
-            FROM {source}
-        ),
-        deduplicated AS (
-            SELECT
-                * EXCLUDE (exact_rank, mmsi_bucket),
-                count(*) OVER (PARTITION BY mmsi, timestamp_utc) > 1 AS is_time_conflict
-            FROM ranked
-            WHERE exact_rank = 1
-        ),
-        sequenced AS (
-            SELECT
-                *,
-                row_number() OVER (
-                    PARTITION BY mmsi ORDER BY timestamp_utc, latitude, longitude
-                ) AS point_seq,
-                lag(timestamp_utc) OVER (
-                    PARTITION BY mmsi ORDER BY timestamp_utc, latitude, longitude
-                ) AS prev_timestamp_utc,
-                lag(latitude) OVER (
-                    PARTITION BY mmsi ORDER BY timestamp_utc, latitude, longitude
-                ) AS prev_latitude,
-                lag(longitude) OVER (
-                    PARTITION BY mmsi ORDER BY timestamp_utc, latitude, longitude
-                ) AS prev_longitude
-            FROM deduplicated
-        ),
-        measured AS (
-            SELECT
-                *,
-                date_diff('second', prev_timestamp_utc, timestamp_utc) AS gap_seconds,
-                CASE WHEN prev_timestamp_utc IS NOT NULL THEN {distance} END AS step_distance_km
-            FROM sequenced
-        ),
-        flagged AS (
-            SELECT
-                *,
-                CASE
-                    WHEN gap_seconds > 0
-                    THEN step_distance_km / gap_seconds * 3600.0 / 1.852
-                END AS implied_speed_knots
-            FROM measured
-        )
-        SELECT
-            * EXCLUDE (prev_timestamp_utc, prev_latitude, prev_longitude),
-            coalesce(implied_speed_knots > {config.prepare.max_implied_speed_knots}, false)
-                AS is_kinematic_outlier,
-            {bucket}::INTEGER AS mmsi_bucket
-        FROM flagged
-        ORDER BY mmsi, point_seq
-    """
-    temporary = temporary_file(output)
-    temporary.unlink(missing_ok=True)
-    output.parent.mkdir(parents=True, exist_ok=True)
     connection = open_database(
         config,
         output_reserve_bytes=output_reserve_bytes,
         workload="bucket",
+        worker_temp_directory=duckdb_temp,
     )
     try:
-        count = int(
+        return int(
             connection.execute(
                 parquet_copy_sql(
                     select_sql,
-                    temporary,
+                    output,
                     config.prepare.compression,
                     config.prepare.row_group_size,
                 )
             ).fetchone()[0]
         )
+    finally:
+        connection.close()
+
+
+def _track_bucket_scratch(config: AppConfig, bucket: int) -> Path:
+    return config.storage.temp_directory / f"track-bucket-{bucket:04d}"
+
+
+def _write_track_bucket(
+    config: AppConfig, paths: list[Path], bucket: int, output: Path
+) -> int:
+    source = parquet_sources(paths)
+    output_reserve_bytes = total_file_size(paths) * 2
+    scratch = _track_bucket_scratch(config, bucket)
+    deduplicated = scratch / "deduplicated.parquet"
+    conflicted = scratch / "conflicted.parquet"
+    phase_path = scratch / "phase.txt"
+    temporary = temporary_file(output)
+    remove_path(scratch, config.storage.temp_directory)
+    temporary.unlink(missing_ok=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        phase_path.write_text("deduplicating", encoding="ascii")
+        deduplication_sql = f"""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    row_number() OVER (
+                        PARTITION BY mmsi, timestamp_utc, latitude, longitude
+                        ORDER BY
+                            source_at_dock DESC NULLS LAST,
+                            msg_type,
+                            msg_id NULLS LAST
+                    ) AS exact_rank
+                FROM {source}
+            )
+            SELECT * EXCLUDE (exact_rank, mmsi_bucket)
+            FROM ranked
+            WHERE exact_rank = 1
+        """
+        deduplicated_count = _copy_track_phase(
+            config,
+            deduplication_sql,
+            deduplicated,
+            output_reserve_bytes,
+            scratch / "duckdb-deduplicating",
+        )
+
+        phase_path.write_text("detecting conflicts", encoding="ascii")
+        conflict_sql = f"""
+            SELECT
+                *,
+                count(*) OVER (PARTITION BY mmsi, timestamp_utc) > 1
+                    AS is_time_conflict
+            FROM read_parquet({sql_literal(str(deduplicated.resolve()))})
+        """
+        conflicted_count = _copy_track_phase(
+            config,
+            conflict_sql,
+            conflicted,
+            output_reserve_bytes,
+            scratch / "duckdb-conflicts",
+        )
+        if conflicted_count != deduplicated_count:
+            raise RuntimeError(
+                f"Track row count changed while detecting conflicts for "
+                f"bucket {bucket:04d}: {deduplicated_count} deduplicated rows, "
+                f"{conflicted_count} conflict rows"
+            )
+        deduplicated.unlink()
+
+        phase_path.write_text("sequencing and writing", encoding="ascii")
+        distance = haversine_km(
+            "prev_latitude", "prev_longitude", "latitude", "longitude"
+        )
+        sequence_sql = f"""
+            WITH sequenced AS (
+                SELECT
+                    *,
+                    row_number() OVER vessel_sequence AS point_seq,
+                    lag(timestamp_utc) OVER vessel_sequence AS prev_timestamp_utc,
+                    lag(latitude) OVER vessel_sequence AS prev_latitude,
+                    lag(longitude) OVER vessel_sequence AS prev_longitude
+                FROM read_parquet({sql_literal(str(conflicted.resolve()))})
+                WINDOW vessel_sequence AS (
+                    PARTITION BY mmsi
+                    ORDER BY timestamp_utc, latitude, longitude
+                )
+            ),
+            measured AS (
+                SELECT
+                    *,
+                    date_diff(
+                        'second', prev_timestamp_utc, timestamp_utc
+                    ) AS gap_seconds,
+                    CASE
+                        WHEN prev_timestamp_utc IS NOT NULL THEN {distance}
+                    END AS step_distance_km
+                FROM sequenced
+            ),
+            flagged AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN gap_seconds > 0
+                        THEN step_distance_km / gap_seconds * 3600.0 / 1.852
+                    END AS implied_speed_knots
+                FROM measured
+            )
+            SELECT
+                * EXCLUDE (prev_timestamp_utc, prev_latitude, prev_longitude),
+                coalesce(
+                    implied_speed_knots
+                        > {config.prepare.max_implied_speed_knots},
+                    false
+                ) AS is_kinematic_outlier,
+                {bucket}::INTEGER AS mmsi_bucket
+            FROM flagged
+            ORDER BY mmsi, point_seq
+        """
+        count = _copy_track_phase(
+            config,
+            sequence_sql,
+            temporary,
+            output_reserve_bytes,
+            scratch / "duckdb-sequencing",
+        )
+        if count != deduplicated_count:
+            raise RuntimeError(
+                f"Track row count changed while sequencing bucket {bucket:04d}: "
+                f"{deduplicated_count} deduplicated rows, {count} sequenced rows"
+            )
+        phase_path.write_text("committing", encoding="ascii")
         replace_file(temporary, output)
         return count
     finally:
         temporary.unlink(missing_ok=True)
-        connection.close()
+        remove_path(scratch, config.storage.temp_directory)
 
 
 def prepare_data(
@@ -513,12 +589,23 @@ def prepare_data(
         )
 
     def poll_buckets(active) -> None:
-        active_text = ",".join(
-            f"{work_by_key[key]['bucket']:04d}" for key in sorted(active)
-        )
+        active_labels = []
+        for key in sorted(active):
+            bucket = work_by_key[key]["bucket"]
+            phase = active[key].phase
+            if phase == "running":
+                phase_path = _track_bucket_scratch(config, bucket) / "phase.txt"
+                try:
+                    phase = phase_path.read_text(encoding="ascii").strip()
+                except OSError:
+                    phase = "starting"
+            active_labels.append(f"{bucket:04d}:{phase}")
+        active_text = ",".join(active_labels)
+        free_tib = free_space_bytes(config.storage.work_root) / TIB
         bucket_progress.set_postfix_str(
             f"active={active_text or '-'} "
-            f"{bucket_estimator.format_eta(bucket_remaining_bytes, bucket_remaining_count)}"
+            f"{bucket_estimator.format_eta(bucket_remaining_bytes, bucket_remaining_count)} "
+            f"free={free_tib:.2f}TiB"
         )
         bucket_progress.refresh()
 

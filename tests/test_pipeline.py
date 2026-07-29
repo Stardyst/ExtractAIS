@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import duckdb
@@ -14,7 +15,7 @@ from extractais.database import open_database
 from extractais.intervals import build_intervals
 from extractais.inventory import discover_files
 from extractais.ports import build_ports
-from extractais.prepare import prepare_data
+from extractais.prepare import _write_track_bucket, prepare_data
 from extractais.split import split_files
 from extractais.stops import build_stops
 from extractais.validate import build_validation
@@ -331,7 +332,10 @@ def test_legacy_runtime_config_gets_resource_defaults(tmp_path: Path) -> None:
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         .replace("  threads: 2\n", "")
-        .replace('  memory_limit: "1GB"\n', ""),
+        .replace('  memory_limit: "1GB"\n', "")
+        .replace("  bucket_workers: 2\n", "")
+        .replace("  bucket_threads: 1\n", "")
+        .replace('  bucket_memory_limit: "384MB"\n', ""),
         encoding="utf-8",
     )
 
@@ -339,6 +343,9 @@ def test_legacy_runtime_config_gets_resource_defaults(tmp_path: Path) -> None:
 
     assert config.runtime.threads == 20
     assert config.runtime.memory_limit == "90GB"
+    assert config.runtime.bucket_workers == 1
+    assert config.runtime.bucket_threads == 8
+    assert config.runtime.bucket_memory_limit == "80GB"
 
 
 def test_production_example_uses_bounded_partition_writers() -> None:
@@ -349,9 +356,9 @@ def test_production_example_uses_bounded_partition_writers() -> None:
     assert config.prepare.partition_write_max_open_files == 256
     assert config.prepare.row_group_size == 250_000
     assert config.runtime.minimum_free_space_gb == 500
-    assert config.runtime.bucket_workers == 2
-    assert config.runtime.bucket_threads == 10
-    assert config.runtime.bucket_memory_limit == "42GB"
+    assert config.runtime.bucket_workers == 1
+    assert config.runtime.bucket_threads == 8
+    assert config.runtime.bucket_memory_limit == "80GB"
     assert config.runtime.bucket_temp_limit_gb == 256
 
 
@@ -419,6 +426,85 @@ def test_bucket_database_uses_bounded_resources_and_no_internal_eta(
 
     assert threads == config.runtime.bucket_threads
     assert progress_enabled is False
+
+
+def test_track_bucket_completes_with_spilling_under_constrained_memory(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    config = load_config(_pipeline_config(tmp_path, raw_root, tmp_path / "work"))
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            bucket_threads=1,
+            bucket_memory_limit="64MB",
+            bucket_temp_limit_gb=1,
+        ),
+    )
+    source = tmp_path / "large-bucket.parquet"
+    output = tmp_path / "track.parquet"
+    duckdb.execute(
+        """
+        COPY (
+            SELECT
+                123000000 + (i % 1000)::BIGINT AS mmsi,
+                TIMESTAMP '2021-01-01'
+                    + (i % 200000) * INTERVAL 1 SECOND AS timestamp_utc,
+                ((i % 10000)::DOUBLE) / 100000 AS latitude,
+                ((i % 15000)::DOUBLE) / 100000 AS longitude,
+                (i % 20)::DOUBLE AS speed,
+                (i % 2) = 0 AS source_at_dock,
+                1::INTEGER AS msg_type,
+                (i % 100000)::BIGINT AS msg_id,
+                0::INTEGER AS mmsi_bucket
+            FROM range(1000000) rows(i)
+        ) TO ? (FORMAT PARQUET, ROW_GROUP_SIZE 100000)
+        """,
+        [str(source)],
+    )
+    expected_rows = duckdb.execute(
+        """
+        SELECT count(*)
+        FROM (
+            SELECT DISTINCT mmsi, timestamp_utc, latitude, longitude
+            FROM read_parquet(?)
+        )
+        """,
+        [str(source)],
+    ).fetchone()[0]
+    expected_conflict_rows = duckdb.execute(
+        """
+        WITH deduplicated AS (
+            SELECT DISTINCT mmsi, timestamp_utc, latitude, longitude
+            FROM read_parquet(?)
+        ),
+        times AS (
+            SELECT mmsi, timestamp_utc, count(*) AS point_count
+            FROM deduplicated
+            GROUP BY mmsi, timestamp_utc
+        )
+        SELECT coalesce(sum(point_count) FILTER (WHERE point_count > 1), 0)
+        FROM times
+        """,
+        [str(source)],
+    ).fetchone()[0]
+
+    row_count = _write_track_bucket(config, [source], 0, output)
+
+    assert row_count == expected_rows
+    result = duckdb.read_parquet(str(output))
+    assert result.aggregate("count(*), min(point_seq), max(point_seq)").fetchone() == (
+        expected_rows,
+        1,
+        expected_rows // 1000,
+    )
+    assert result.aggregate("count(*) FILTER (WHERE is_time_conflict)").fetchone()[
+        0
+    ] == expected_conflict_rows
+    assert not list(config.storage.temp_directory.rglob("*"))
 
 
 def test_diagnostic_classifies_file_multiplication_in_prepare() -> None:

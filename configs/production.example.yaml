@@ -13,9 +13,9 @@ storage:
 runtime:
   threads: 20
   memory_limit: "90GB"
-  bucket_workers: 2
-  bucket_threads: 10
-  bucket_memory_limit: "42GB"
+  bucket_workers: 1
+  bucket_threads: 8
+  bucket_memory_limit: "80GB"
   bucket_temp_limit_gb: 256
   enable_progress: true
   # Preserve this much free space after the next estimated work-unit output.

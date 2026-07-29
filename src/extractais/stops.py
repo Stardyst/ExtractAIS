@@ -6,7 +6,7 @@ from typing import Any, Dict
 from extractais.bucketstage import BucketExecution, BucketTask, run_bucket_stage
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql
-from extractais.fileutils import replace_file, temporary_file
+from extractais.fileutils import remove_path, replace_file, temporary_file
 from extractais.gitmeta import git_commit
 from extractais.isolated import IsolatedCall
 from extractais.sql import haversine_km, parquet_sources
@@ -114,30 +114,37 @@ def _write_stop_bucket(config: AppConfig, source_path: Path, output: Path) -> in
         ORDER BY mmsi, start_time_utc
     """
     temporary = temporary_file(output)
+    worker_temp = (
+        config.storage.temp_directory
+        / f"stops-bucket-{bucket_number(source_path):04d}"
+    )
+    remove_path(worker_temp, config.storage.temp_directory)
     temporary.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    connection = open_database(
-        config,
-        output_reserve_bytes=source_path.stat().st_size,
-        workload="bucket",
-    )
     try:
-        result = connection.execute(
-            parquet_copy_sql(
-                select_sql,
-                temporary,
-                config.prepare.compression,
-                config.prepare.row_group_size,
-            )
-        ).fetchone()
-        count = int(result[0])
-    finally:
-        connection.close()
-    try:
+        connection = open_database(
+            config,
+            output_reserve_bytes=source_path.stat().st_size,
+            workload="bucket",
+            worker_temp_directory=worker_temp,
+        )
+        try:
+            result = connection.execute(
+                parquet_copy_sql(
+                    select_sql,
+                    temporary,
+                    config.prepare.compression,
+                    config.prepare.row_group_size,
+                )
+            ).fetchone()
+            count = int(result[0])
+        finally:
+            connection.close()
         replace_file(temporary, output)
         return count
     finally:
         temporary.unlink(missing_ok=True)
+        remove_path(worker_temp, config.storage.temp_directory)
 
 
 def build_stops(

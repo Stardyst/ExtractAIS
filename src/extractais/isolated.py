@@ -36,6 +36,7 @@ class ActiveProcess:
     key: str
     process_id: int
     started_at: float
+    phase: str = "running"
 
 
 def _worker_entry(sender, target: Callable, args: tuple, kwargs: dict) -> None:
@@ -76,6 +77,7 @@ def run_isolated_many(
     calls: Iterable[IsolatedCall],
     max_workers: int,
     poll_interval_seconds: float = 1.0,
+    worker_exit_timeout_seconds: float = 5.0,
     on_poll: Callable[[Mapping[str, ActiveProcess]], None] | None = None,
     before_start: Callable[
         [IsolatedCall, Mapping[str, ActiveProcess]], None
@@ -86,11 +88,24 @@ def run_isolated_many(
         raise ValueError("max_workers must be positive")
     if poll_interval_seconds <= 0:
         raise ValueError("poll_interval_seconds must be positive")
+    if worker_exit_timeout_seconds <= 0:
+        raise ValueError("worker_exit_timeout_seconds must be positive")
 
     context = multiprocessing.get_context("spawn")
     pending = iter(calls)
     exhausted = False
     active: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+
+    def stop_process(process) -> None:
+        process.join(timeout=worker_exit_timeout_seconds)
+        if not process.is_alive():
+            return
+        process.terminate()
+        process.join(timeout=worker_exit_timeout_seconds)
+        if process.is_alive():
+            process.kill()
+            process.join()
 
     def terminate_active() -> None:
         for state in active.values():
@@ -98,7 +113,7 @@ def run_isolated_many(
             if process.is_alive():
                 process.terminate()
         for state in active.values():
-            state["process"].join()
+            stop_process(state["process"])
             state["receiver"].close()
         active.clear()
 
@@ -120,6 +135,7 @@ def run_isolated_many(
                                 key=key,
                                 process_id=int(state["process"].pid),
                                 started_at=float(state["started"]),
+                                phase=str(state["phase"]),
                             )
                             for key, state in active.items()
                         },
@@ -142,6 +158,7 @@ def run_isolated_many(
                     "receiver": receiver,
                     "process": process,
                     "started": started,
+                    "phase": "running",
                 }
 
             if on_poll is not None:
@@ -151,6 +168,7 @@ def run_isolated_many(
                             key=key,
                             process_id=int(state["process"].pid),
                             started_at=float(state["started"]),
+                            phase=str(state["phase"]),
                         )
                         for key, state in active.items()
                     }
@@ -172,7 +190,7 @@ def run_isolated_many(
                 if state["receiver"] in ready_set
             ]
             for key in completed_keys:
-                state = active.pop(key)
+                state = active[key]
                 receiver = state["receiver"]
                 process = state["process"]
                 payload = None
@@ -181,34 +199,57 @@ def run_isolated_many(
                         payload = receiver.recv()
                     except EOFError:
                         pass
-                    process.join()
+                    state["phase"] = "worker shutdown"
+                    if on_poll is not None:
+                        on_poll(
+                            {
+                                active_key: ActiveProcess(
+                                    key=active_key,
+                                    process_id=int(active_state["process"].pid),
+                                    started_at=float(active_state["started"]),
+                                    phase=str(active_state["phase"]),
+                                )
+                                for active_key, active_state in active.items()
+                            }
+                        )
+                    stop_process(process)
                 finally:
-                    receiver.close()
+                    try:
+                        if process.is_alive():
+                            stop_process(process)
+                    finally:
+                        receiver.close()
+                        active.pop(key, None)
 
                 if payload is None:
-                    terminate_active()
-                    raise RuntimeError(
-                        f"Worker {process.pid} exited with code "
-                        f"{process.exitcode} without a result"
+                    failures.append(
+                        {
+                            "process_id": process.pid,
+                            "error": (
+                                f"Worker exited with code {process.exitcode} "
+                                "without a result"
+                            ),
+                            "traceback": "",
+                        }
                     )
+                    exhausted = True
+                    continue
                 if not payload["ok"]:
-                    terminate_active()
-                    raise RuntimeError(
-                        f"Worker {payload['process_id']} failed: "
-                        f"{payload['error']}\n{payload['traceback']}"
-                    )
-                if process.exitcode != 0:
-                    terminate_active()
-                    raise RuntimeError(
-                        f"Worker {payload['process_id']} exited with code "
-                        f"{process.exitcode}"
-                    )
+                    failures.append(payload)
+                    exhausted = True
+                    continue
                 yield IsolatedTaskResult(
                     key=key,
                     value=payload["value"],
                     process_id=int(payload["process_id"]),
                     elapsed_seconds=time.perf_counter() - float(state["started"]),
                 )
+        if failures:
+            failure = failures[0]
+            raise RuntimeError(
+                f"Worker {failure['process_id']} failed: "
+                f"{failure['error']}\n{failure['traceback']}"
+            )
     except BaseException:
         terminate_active()
         raise

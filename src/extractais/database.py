@@ -17,6 +17,7 @@ def open_database(
     config: AppConfig,
     output_reserve_bytes: int = 0,
     workload: str = "global",
+    worker_temp_directory: Path | None = None,
 ) -> duckdb.DuckDBPyConnection:
     if workload not in {"global", "bucket"}:
         raise ValueError(f"Unknown DuckDB workload profile: {workload}")
@@ -30,7 +31,9 @@ def open_database(
         if workload == "bucket"
         else config.runtime.memory_limit
     )
-    worker_temp = config.storage.temp_directory / f"worker-{os.getpid()}"
+    worker_temp = worker_temp_directory or (
+        config.storage.temp_directory / f"worker-{os.getpid()}"
+    )
     worker_temp.mkdir(parents=True, exist_ok=True)
     temp_budget_bytes = duckdb_temp_budget_bytes(config, output_reserve_bytes)
     if workload == "bucket":
