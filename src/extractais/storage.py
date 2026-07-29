@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -10,6 +11,17 @@ from extractais.config import AppConfig
 
 GIB = 1024**3
 TIB = 1024**4
+
+
+def parse_size_bytes(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?I?B)\s*", value.upper())
+    if match is None:
+        raise ValueError(f"Unsupported size value: {value}")
+    amount = float(match.group(1))
+    unit = match.group(2)
+    decimal = {"B": 1, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4}
+    binary = {"KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4}
+    return int(amount * (decimal | binary)[unit])
 
 
 def total_file_size(paths: Iterable[Path]) -> int:

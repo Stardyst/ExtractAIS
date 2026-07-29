@@ -104,7 +104,7 @@ $patterns = switch ($activeStage) {
         @(
             (Join-Path $workRoot "stage02_partitioned\year=*\month=*.tmp"),
             (Join-Path $workRoot "stage02_static\*.tmp.parquet"),
-            (Join-Path $workRoot "stage03_tracks\mmsi_bucket=*\*.tmp.parquet")
+            (Join-Path $tempRoot "track-bucket-*")
         )
     }
     "stops" { @((Join-Path $workRoot "stage04_stops\mmsi_bucket=*\*.tmp.parquet")) }

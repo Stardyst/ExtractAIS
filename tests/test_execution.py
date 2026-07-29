@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from extractais.isolated import IsolatedCall, run_isolated_many
-from extractais.progress import HONEST_BAR_FORMAT, ProgressEstimator
+from extractais.progress import (
+    HONEST_BAR_FORMAT,
+    FRACTIONAL_BAR_FORMAT,
+    ProgressEstimator,
+    advance_progress_to,
+)
+from extractais.storage import parse_size_bytes
 
 
 def _sleep_and_return(delay: float) -> str:
@@ -41,6 +47,35 @@ def test_eta_is_hidden_until_real_work_unit_completes() -> None:
     assert estimator.format_eta(10_000_000) == "ETA 00:00:05"
     assert estimator.format_eta(10_000_000, worker_count=1) == "ETA 00:00:10"
     assert "remaining" not in HONEST_BAR_FORMAT
+    assert "{n_fmt}" not in FRACTIONAL_BAR_FORMAT
+    assert "{percentage:6.2f}" in FRACTIONAL_BAR_FORMAT
+
+
+def test_fractional_progress_advances_monotonically_before_completion() -> None:
+    class ProgressRecorder:
+        def __init__(self) -> None:
+            self.n = 0.0
+            self.total = 2.0
+            self.values: list[float] = []
+
+        def refresh(self) -> None:
+            self.values.append(self.n)
+
+    progress = ProgressRecorder()
+
+    advance_progress_to(progress, 0.10)
+    advance_progress_to(progress, 0.35)
+    advance_progress_to(progress, 0.20)
+    advance_progress_to(progress, 1.00)
+
+    assert progress.values == [0.10, 0.35, 1.00]
+    assert 0 < progress.values[0] < progress.total
+
+
+def test_duckdb_memory_limit_parser_matches_decimal_and_binary_units() -> None:
+    assert parse_size_bytes("80GB") == 80_000_000_000
+    assert parse_size_bytes("64MB") == 64_000_000
+    assert parse_size_bytes("1GiB") == 1024**3
 
 
 def test_isolated_scheduler_never_exceeds_worker_limit() -> None:

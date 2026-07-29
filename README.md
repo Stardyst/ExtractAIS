@@ -22,7 +22,7 @@ python -m pip install -e .
 python -c "import extractais; print(extractais.__version__)"
 ```
 
-当前版本应显示 `1.5.0`。
+当前版本应显示 `1.6.0`。
 
 ## 2. 准备生产配置
 
@@ -61,7 +61,7 @@ runtime:
   minimum_free_space_gb: 500
 ```
 
-月度分区、静态表、全局港口锚点和验证报告使用全局档位；MMSI 分桶排序、停留、停留到港口匹配、港口调用和区间构建使用一个桶工人。生产轨迹桶实测最大约为平均值的 4.1 倍，单个 42 GB 工人在多窗口排序中会触及 DuckDB 内存上限；80 GB 档位约占 128 GiB 物理内存的 58%，并为系统和 DuckDB 非缓冲区分配保留空间。单 HDD 不应增加 `bucket_workers`，否则会重新引入内存竞争和随机 I/O。旧配置缺少资源字段时采用这里的默认值。
+月度分区、静态表、全局港口锚点和验证报告使用全局档位；轨迹工作单元、停留、停留到港口匹配、港口调用和区间构建使用桶档位。阶段 02 仍使用 256 个粗 MMSI 桶，但阶段 03 会按 `hash(mmsi)` 将每个粗桶自适应细分，目标为每片不超过约 512 MiB 压缩输入；同一 MMSI 永远只在一片中。窗口线程数还会受实际内存上限约束。单 HDD 保持 `bucket_workers: 1`，避免随机 I/O；80 GB 档位为异常数据分布和 DuckDB 非缓冲区分配保留余量。
 
 生产配置还必须为每个 MMSI 桶保留一个月度分区写入器：
 
@@ -128,11 +128,11 @@ extractais --config configs/production.yaml validate
 | 命令 | 处理内容 | 恢复粒度 |
 |---|---|---|
 | `split` | 每个 CSV 只解析一次；动态报文与静态报文立即分离为 Parquet | 每日文件 |
-| `prepare` | 静态信息压缩到每 MMSI 一行；动态信息按月一次扫描并分桶；每桶按 MMSI/时间排序、去重、标记异常 | 月、MMSI 桶 |
-| `stops` | 从低速、连续、有限空间范围的位置点中提取停留事件 | MMSI 桶 |
-| `ports` | 读取 WPI，合并无法区分的近邻港口，建立多圆锚点，再按桶匹配停留事件 | 全局目录、MMSI 桶 |
-| `calls` | 精确计算位置到锚点距离，保留候选港口，使用独立检测的停留事件确认港口调用 | MMSI 桶 |
-| `intervals` | 识别五状态、插入长中断、压缩连续状态并直接写入年度最终目录 | MMSI 桶 |
+| `prepare` | 静态信息压缩到每 MMSI 一行；动态信息按月一次扫描并粗分桶；再自适应细分、去重、排序和标记异常 | 月、静态表、轨迹源桶/细片 |
+| `stops` | 从低速、连续、有限空间范围的位置点中提取停留事件 | 轨迹细片 |
+| `ports` | 读取 WPI，合并无法区分的近邻港口，建立多圆锚点，再按细片匹配停留事件 | 全局目录、轨迹细片 |
+| `calls` | 精确计算位置到锚点距离，保留候选港口，使用独立检测的停留事件确认港口调用 | 轨迹细片 |
+| `intervals` | 识别五状态、插入长中断、压缩连续状态并直接写入年度最终目录 | 轨迹细片 |
 | `validate` | 汇总港口覆盖、调用、歧义、Harbor Size 和状态质量 | 整个验证报告 |
 
 ## 6. 中断和恢复
@@ -145,8 +145,8 @@ extractais --config configs/production.yaml run-all
 
 恢复规则如下：
 
-- 已完成的日、月或 MMSI 桶直接跳过。
-- 正在执行但尚未完成的最小工作单元会从头重算。
+- 已完成的日、月、轨迹源桶或轨迹细片直接跳过。
+- `prepare` 在每个轨迹细片原子提交后立即写检查点；中断后只重建缺失或不完整的细片。
 - 每个重型工作单元在独立操作系统子进程中运行；单元结束后进程退出，DuckDB 原生分配器、缓存、线程和句柄由操作系统整体回收。
 - 子进程返回成功结果后只等待有限时间退出；解释器清理不会再让主进度永久卡在 `worker shutdown`。
 - 一个桶失败后停止派发新桶，但允许已经运行的桶完成并提交，再报告原始错误。
@@ -154,7 +154,7 @@ extractais --config configs/production.yaml run-all
 - 检查点位于 `derived/manifests/*.json`，包含输入身份、阶段参数哈希、Git commit、子进程 PID、耗时和输出路径。
 - `--force` 会重建该命令所有已完成工作单元，只在确认需要重算时使用。
 
-子进程隔离边界与恢复粒度一致：`split` 为每日文件，`prepare` 为月/静态表/MMSI 桶，`stops`、停留到港口匹配、`calls` 和 `intervals` 为 MMSI 桶，港口锚点和 `validate` 为全局单元。全局单元一次运行一个进程；桶阶段最多同时运行 `bucket_workers` 个进程，每个进程严格使用桶档位的线程、内存和独立临时目录。
+子进程隔离边界与恢复粒度一致：`split` 为每日文件，`prepare` 为月/静态表/轨迹源桶及其细片，`stops`、停留到港口匹配、`calls` 和 `intervals` 为轨迹细片，港口锚点和 `validate` 为全局单元。全局单元一次运行一个进程；细片阶段最多同时运行 `bucket_workers` 个进程，每个进程严格使用桶档位的线程、内存和独立临时目录。
 
 ### 从旧版本继续现有任务
 
@@ -168,7 +168,7 @@ python -c "import extractais; print(extractais.__version__)"
 extractais --config configs/production.yaml status
 ```
 
-版本应为 `1.5.0`。不需要删除 `derived`，也不要加 `--force`。`configs/production.yaml` 不受 Git 管理，因此从旧版升级时必须手工确认 `bucket_workers: 1`、`bucket_threads: 8` 和 `bucket_memory_limit: "80GB"`。若配置中仍是 `partition_write_max_open_files: 100`，也必须改为 `256`。
+版本应为 `1.6.0`。不需要删除 `derived`，也不要加 `--force`。`configs/production.yaml` 不受 Git 管理，因此升级时必须手工确认 `bucket_workers: 1`、`bucket_threads: 8` 和 `bucket_memory_limit: "80GB"`。若配置中仍是 `partition_write_max_open_files: 100`，也必须改为 `256`。
 
 当前是在 `prepare` 中途暂停时，继续执行：
 
@@ -176,7 +176,7 @@ extractais --config configs/production.yaml status
 extractais --config configs/production.yaml prepare
 ```
 
-已经提交的月份、静态表和轨迹桶保持有效；失败时正在处理且尚未提交的桶会重算。不要在同一份 `derived` 中改变 `prepare.mmsi_buckets`；若当前已使用 256，应继续保持 256。轨迹桶现在依次物化精确去重、同时间冲突和序列计算，避免多个阻塞窗口同时占满内存。后续桶阶段也使用任务级临时目录，重试会先清理该任务残留。
+首次使用 1.6.0 执行 `prepare` 时，程序会写入轨迹布局标记，清理旧版 `stage03_tracks` 以及阶段 04 以后依赖旧桶编号的派生目录和 manifest。已经完成的 split、24 个月分区和静态船舶表保持有效，不会重新计算；后续结果将基于新轨迹细片重建，杜绝混入旧桶文件。不要改变 `prepare.mmsi_buckets`，当前应继续保持 256。每个粗桶先流式细分，再逐片物化精确去重、同时间冲突和序列计算；细片成功后立即写入独立检查点。
 
 旧版异常退出可能在 `derived/tmp/worker-*` 留下临时文件。只有在确认没有 ExtractAIS 进程运行后，才执行一次清理：
 
@@ -205,18 +205,18 @@ derived/
     static/year=YYYY/month=MM/day=DD/part.parquet
   stage02_partitioned/               # 按月建立的临时 MMSI 分桶
   stage02_static/vessels.parquet     # 每 MMSI 一行的最新静态信息
-  stage03_tracks/mmsi_bucket=NNNN/part.parquet
-  stage04_stops/mmsi_bucket=NNNN/part.parquet
+  stage03_tracks/mmsi_bucket=NNNNN/part.parquet  # 自适应轨迹细片
+  stage04_stops/mmsi_bucket=NNNNN/part.parquet
   stage05_ports/
     anchors.parquet
     anchor_tiles.parquet
-    stop_port_matches/mmsi_bucket=NNNN/part.parquet
-  stage06_port_calls/mmsi_bucket=NNNN/
+    stop_port_matches/mmsi_bucket=NNNNN/part.parquet
+  stage06_port_calls/mmsi_bucket=NNNNN/
     candidates.parquet
     port_context.parquet
     port_calls.parquet
   outputs/
-    trajectory_intervals/year=YYYY/mmsi_bucket=NNNN.parquet
+    trajectory_intervals/year=YYYY/mmsi_bucket=NNNNN.parquet
     validation/
 ```
 
@@ -243,7 +243,7 @@ E:/AIS2021-2022/derived/outputs/trajectory_intervals/year=2022/*.parquet
 | `point_count` | 构成区间的有效 AIS 位置数；中断为 0 |
 | `max_gap_seconds` | 区间内最大观测间隔，用于审计 |
 | `quality_flag` | `OBSERVED`、`NO_AIS`、`PORT_AMBIGUOUS` 或 `TIME_CONFLICT` |
-| `mmsi_bucket` | 物理分桶号，便于并行读取和问题追踪 |
+| `mmsi_bucket` | 阶段 03 的物理轨迹细片号，便于并行读取和问题追踪；不再等同于原始 `mmsi % 256` 粗桶号 |
 
 最终表不包含区间起止经纬度、持续时间或直线距离。持续时间可由两个 UTC 字段计算；轨迹距离应基于完整位置序列另行计算。
 
@@ -296,15 +296,18 @@ extractais --config configs/production.yaml validate
 - `split` 每天只扫描一次规范化结果用于汇总，再分别写入动态和静态 Parquet；`COPY` 返回值直接作为有效行数，不再额外全表计数。
 - 恢复时总进度从已完成文件的真实字节数开始，跳过旧日期不会再产生虚假的 TB/s 瞬时速度。
 - 每个重型工作单元由独立子进程执行，修复了长时间运行中 DuckDB 连接虽然关闭、但同一 Python 进程的原生分配器和缓存仍持续累积而导致的吞吐衰减。
-- `prepare` 使用 256 个 MMSI 桶，使当前实测月度输入平均每桶约 119 MiB；月度分区同时保持 256 个写入器，使每个非空桶只生成一个 Parquet 文件。
+- `prepare` 的月度中间层使用 256 个粗 MMSI 桶，使当前实测月度输入平均每桶约 119 MiB；月度分区同时保持 256 个写入器，使每个非空桶只生成一个 Parquet 文件。
+- 全年粗桶最大实测为 13.33 GiB 压缩数据，无法直接执行全局窗口。阶段 03 根据粗桶大小和每线程可用内存将其细分；13.33 GiB 桶在生产配置下分为 32 片，平均粗桶通常分为 8 片。同一 MMSI 不跨片，后续所有阶段继续使用这些细片。
 - 生产 `row_group_size` 为 250000，降低分区写入峰值内存，并为后续单桶并行扫描保留足够的 row group。
 - 在同一份 1000 万行、256 桶合成输入上，`partition_write_max_open_files=100` 用时 13.99 秒并生成 5120 个文件；设置为 256 后用时 8.03 秒且只生成 256 个文件。生产诊断中观察到的 17754 个文件正是相同的写入器轮换问题。
 - 第一个月尚未提交时，进度条每 30 秒更新临时输出 GiB 和文件数。月度提交前还会强制检查文件数不得超过 MMSI 桶数。
 - DuckDB 内部进度条已关闭，因为其算子百分比不包含阻塞算子的收尾、Parquet flush 和文件替换，曾把剩余时间低估到实际值的约四分之一。
-- 主进度条只使用已经完整提交的相同工作单元计算 ETA。没有实测样本时显示 `ETA calibrating`；随后采用最近 12 个单元的中位吞吐率，并在尾部按实际剩余工人数修正。该 ETA 包含完整查询和输出收尾时间，不使用当前 DuckDB 算子百分比。
-- 桶阶段显示活动桶、当前处理子阶段、已提交桶数、实测 MiB/s、ETA 和剩余 TiB。`prepare` 排序、`stops`、停留匹配、`calls`、`intervals` 均使用相同调度器。
+- 主进度条的 ETA 只使用已经完整提交的相同工作单元。没有实测样本时显示 `ETA calibrating`；随后采用最近 12 个单元的中位吞吐率，并在尾部按实际剩余工人数修正。
+- `prepare` 的轨迹进度不再只按 256 个粗桶整数计数。重分片期间根据已写字节推进，随后按当前细片的去重、冲突检测、序列计算和提交阶段产生单调递增的分数进度；粗桶完成后才加入 ETA 样本。百分比保留两位小数，因此第一只生产大桶内部也会显示变化；进度尾部会显示类似 `0000:shard 7/32 sequencing and writing`。
+- 后续 `stops`、停留匹配、`calls` 和 `intervals` 直接以较小轨迹细片为工作单元，因此进度会在每个细片提交后持续推进，而不是等待一个十几 GiB 大桶完成。
 - 动态分桶按月只扫描一次，不会为 256 个桶重复扫描全年数据。
-- 停留到港口匹配按 MMSI 桶保存，不再生成一个全局匹配大表；港口调用生成一次紧凑 `port_context`，区间和验证复用它；区间直接写最终年度文件，不再保留并再次扫描一份 `stage07_intervals`。
+- 停留到港口匹配按轨迹细片保存，不再生成一个全局匹配大表；港口调用生成一次紧凑 `port_context`，区间和验证复用它；区间直接写最终年度文件，不再保留并再次扫描一份 `stage07_intervals`。
+- 细分数据只在当前粗桶的临时目录中存在，完成后删除；不会永久复制一份 836.64 GiB 的阶段 02 分区。阶段 03 最终总量仍按实测比例预计约 865 GiB。
 - `stage01_split`、`stage02_partitioned` 和 `stage03_tracks` 会短期同时存在。4.48 TB 是否足够应以完整月份试运行的实际压缩比为准。
 - `temp_directory` 必须和 `work_root` 位于容量充足的工作盘；不要指向系统盘。
 - 全局任务要求 `free >= minimum_free_space + estimated_output`。桶任务还会预留 `bucket_workers * bucket_temp_limit_gb` 和活动桶的预计输出；默认固定预留为 `500 + 1 * 256 = 756 GiB`。不满足时会在启动下一个子进程前报 `Storage guard stopped`，已提交检查点不受损。

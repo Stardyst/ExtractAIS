@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_force(split_parser)
 
     for name, help_text in (
-        ("prepare", "compact static AIS and build sorted MMSI track buckets"),
+        ("prepare", "compact static AIS and build bounded track work units"),
         ("stops", "detect stationary events"),
         ("ports", "build port groups and multi-circle anchors"),
         ("calls", "match positions and confirm port calls"),
@@ -89,9 +89,28 @@ def _status(config: AppConfig) -> dict[str, Any]:
         ),
         "failed_files": sum(row.get("status") == "failed" for row in split_files_state.values()),
     }
+    prepare_manifest: dict[str, Any] = {}
     for name in ("prepare", "stops", "ports", "calls", "intervals", "validate"):
         manifest = read_json(manifest_root / f"{name}.json", {"stage": name, "items": {}})
         stages[name] = _stage_summary(manifest)
+        if name == "prepare":
+            prepare_manifest = manifest
+    track_source_items = [
+        item
+        for key, item in prepare_manifest.get("items", {}).items()
+        if key.startswith("track-source:") and item.get("status") == "complete"
+    ]
+    stages["prepare"].update(
+        {
+            "completed_track_source_buckets": len(track_source_items),
+            "completed_track_work_units": sum(
+                int(item.get("active_shard_count", 0)) for item in track_source_items
+            ),
+            "track_layout": read_json(
+                config.storage.work_root / "stage03_tracks" / "_layout.json", {}
+            ),
+        }
+    )
     return {
         "work_root": str(config.storage.work_root.resolve()),
         "free_space_gb": round(free_space_gb, 2),

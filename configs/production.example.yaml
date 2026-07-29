@@ -13,6 +13,8 @@ storage:
 runtime:
   threads: 20
   memory_limit: "90GB"
+  # One worker avoids random I/O on the production HDD. Prepare permanently
+  # subdivides large full-archive buckets before running window queries.
   bucket_workers: 1
   bucket_threads: 8
   bucket_memory_limit: "80GB"
@@ -29,8 +31,8 @@ split:
   row_group_size: 1000000
 
 prepare:
-  # 256 buckets keep monthly partitions above roughly 100 MiB while leaving
-  # each full-archive bucket manageable on a 128 GiB host.
+  # 256 buckets keep monthly partitions above roughly 100 MiB. Stage 03 then
+  # hash-shards each full-archive bucket into bounded permanent work units.
   # Do not change this after prepare has started.
   mmsi_buckets: 256
   # Keep one writer open per bucket. A lower value repeatedly closes writers

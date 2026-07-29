@@ -8,6 +8,17 @@ HONEST_BAR_FORMAT = (
     "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
     "[{elapsed}, {postfix}]"
 )
+FRACTIONAL_BAR_FORMAT = (
+    "{desc}: {percentage:6.2f}%|{bar}| [{elapsed}, {postfix}]"
+)
+
+
+def advance_progress_to(progress, value: float) -> None:
+    """Advance a tqdm-compatible progress object without moving backwards."""
+    bounded = min(float(progress.total), max(float(progress.n), float(value)))
+    if bounded > float(progress.n):
+        progress.n = bounded
+        progress.refresh()
 
 
 def format_duration(seconds: float) -> str:

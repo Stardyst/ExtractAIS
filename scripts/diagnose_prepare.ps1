@@ -35,8 +35,8 @@ print(json.dumps({
     "temp_directory": str(config.storage.temp_directory),
     "mmsi_buckets": config.prepare.mmsi_buckets,
     "partition_write_max_open_files": config.prepare.partition_write_max_open_files,
-    "threads": config.runtime.threads,
-    "memory_limit": config.runtime.memory_limit,
+    "threads": config.runtime.bucket_threads,
+    "memory_limit": config.runtime.bucket_memory_limit,
     "minimum_free_space_gb": config.runtime.minimum_free_space_gb,
     "extractais_version": extractais.__version__,
     "duckdb_version": duckdb.__version__,
@@ -77,7 +77,16 @@ function Get-ManifestItem {
 function Test-ManifestItemComplete {
     param([string]$Name)
     $item = Get-ManifestItem -Name $Name
-    return $null -ne $item -and $item.status -eq "complete" -and (Test-Path -LiteralPath $item.output)
+    if ($null -eq $item -or $item.status -ne "complete") {
+        return $false
+    }
+    if ($null -ne $item.output) {
+        return Test-Path -LiteralPath $item.output
+    }
+    $outputs = @($item.outputs)
+    return $outputs.Count -gt 0 -and @(
+        $outputs | Where-Object { -not (Test-Path -LiteralPath $_) }
+    ).Count -eq 0
 }
 
 function Get-PathSnapshot {
@@ -132,22 +141,26 @@ if ($null -eq $phase) {
 }
 
 if ($null -eq $phase) {
-    $tracksRoot = Join-Path $workRoot "stage03_tracks"
-    if (Test-Path -LiteralPath $tracksRoot) {
-        $liveTrackTemp = Get-ChildItem -LiteralPath $tracksRoot -Filter "part.tmp.parquet" `
-            -File -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object -Property LastWriteTime -Descending |
-            Select-Object -First 1
-        if ($null -ne $liveTrackTemp) {
-            $phase = "sort_mmsi_bucket"
-            $unit = $liveTrackTemp.Directory.Name -replace "^mmsi_bucket=", ""
-            $bucketNumber = [int]$unit
-            $sourceFiles = @(Get-ChildItem -LiteralPath $partitionRoot `
-                -Filter "*.parquet" -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match "mmsi_bucket=$bucketNumber([\\/])" })
-            $sourceBytes = [int64](($sourceFiles | Measure-Object -Property Length -Sum).Sum)
-            $activeOutputPath = $liveTrackTemp.FullName
+    $liveTrackProgress = Get-ChildItem -LiteralPath $tempRoot -Filter "progress.json" `
+        -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -match "^track-bucket-\d{4}$" } |
+        Sort-Object -Property LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -ne $liveTrackProgress) {
+        $trackProgress = Get-Content -LiteralPath $liveTrackProgress.FullName -Raw |
+            ConvertFrom-Json
+        $bucketNumber = [int]$trackProgress.source_bucket
+        $bucketText = $bucketNumber.ToString("0000")
+        $phase = "build_track_work_units / $($trackProgress.phase)"
+        $unit = $bucketText
+        if ($null -ne $trackProgress.current_shard) {
+            $unit = "$bucketText / shard $($trackProgress.current_shard)"
         }
+        $sourceFiles = @(Get-ChildItem -LiteralPath $partitionRoot `
+            -Filter "*.parquet" -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "mmsi_bucket=$bucketNumber([\\/])" })
+        $sourceBytes = [int64](($sourceFiles | Measure-Object -Property Length -Sum).Sum)
+        $activeOutputPath = $liveTrackProgress.Directory.FullName
     }
 }
 
@@ -173,21 +186,21 @@ if ($null -eq $phase -and -not (Test-ManifestItemComplete -Name "static")) {
 if ($null -eq $phase) {
     for ($bucket = 0; $bucket -lt [int]$configInfo.mmsi_buckets; $bucket++) {
         $bucketText = $bucket.ToString("0000")
-        if (-not (Test-ManifestItemComplete -Name "track:$bucketText")) {
-            $phase = "sort_mmsi_bucket"
+        if (-not (Test-ManifestItemComplete -Name "track-source:$bucketText")) {
+            $phase = "build_track_work_units"
             $unit = $bucketText
             $sourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $workRoot "stage02_partitioned") `
                 -Filter "*.parquet" -File -Recurse -ErrorAction SilentlyContinue |
                 Where-Object { $_.FullName -match "mmsi_bucket=$bucket([\\/])" })
             $sourceBytes = [int64](($sourceFiles | Measure-Object -Property Length -Sum).Sum)
-            $activeOutputPath = Join-Path $workRoot "stage03_tracks\mmsi_bucket=$bucketText\part.tmp.parquet"
+            $activeOutputPath = Join-Path $tempRoot "track-bucket-$bucketText"
             break
         }
     }
 }
 
 if ($null -eq $phase) {
-    throw "Prepare appears complete; no incomplete month, static table, or MMSI bucket was found."
+    throw "Prepare appears complete; no incomplete month, static table, or track source bucket was found."
 }
 
 $workDrive = [System.IO.Path]::GetPathRoot($workRoot).TrimEnd("\").TrimEnd(":")

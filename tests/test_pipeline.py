@@ -15,7 +15,13 @@ from extractais.database import open_database
 from extractais.intervals import build_intervals
 from extractais.inventory import discover_files
 from extractais.ports import build_ports
-from extractais.prepare import _write_track_bucket, prepare_data
+from extractais.prepare import (
+    TRACK_LAYOUT_VERSION,
+    _ensure_track_layout,
+    _track_shard_count,
+    _write_track_source_bucket,
+    prepare_data,
+)
 from extractais.split import split_files
 from extractais.stops import build_stops
 from extractais.validate import build_validation
@@ -360,6 +366,8 @@ def test_production_example_uses_bounded_partition_writers() -> None:
     assert config.runtime.bucket_threads == 8
     assert config.runtime.bucket_memory_limit == "80GB"
     assert config.runtime.bucket_temp_limit_gb == 256
+    assert _track_shard_count(config, int(13.33 * 1024**3)) == 32
+    assert _track_shard_count(config, int(3.27 * 1024**3)) == 8
 
 
 def test_partition_writer_rejects_fewer_open_files_than_buckets(
@@ -439,13 +447,13 @@ def test_track_bucket_completes_with_spilling_under_constrained_memory(
         config,
         runtime=replace(
             config.runtime,
-            bucket_threads=1,
+            bucket_threads=8,
             bucket_memory_limit="64MB",
             bucket_temp_limit_gb=1,
         ),
     )
     source = tmp_path / "large-bucket.parquet"
-    output = tmp_path / "track.parquet"
+    tracks_root = tmp_path / "tracks"
     duckdb.execute(
         """
         COPY (
@@ -492,19 +500,119 @@ def test_track_bucket_completes_with_spilling_under_constrained_memory(
         [str(source)],
     ).fetchone()[0]
 
-    row_count = _write_track_bucket(config, [source], 0, output)
+    result = _write_track_source_bucket(
+        config,
+        [source],
+        0,
+        tracks_root,
+        "test-source-signature",
+        "test-track-hash",
+        True,
+    )
 
-    assert row_count == expected_rows
-    result = duckdb.read_parquet(str(output))
-    assert result.aggregate("count(*), min(point_seq), max(point_seq)").fetchone() == (
+    outputs = [Path(path) for path in result["outputs"]]
+    assert result["row_count"] == expected_rows
+    assert len(outputs) > 1
+    tracks = duckdb.read_parquet([str(path) for path in outputs])
+    assert tracks.aggregate("count(*), min(point_seq), max(point_seq)").fetchone() == (
         expected_rows,
         1,
         expected_rows // 1000,
     )
-    assert result.aggregate("count(*) FILTER (WHERE is_time_conflict)").fetchone()[
+    assert tracks.aggregate("count(*) FILTER (WHERE is_time_conflict)").fetchone()[
         0
     ] == expected_conflict_rows
+    split_vessels = duckdb.execute(
+        """
+        SELECT count(*)
+        FROM (
+            SELECT mmsi
+            FROM read_parquet(?, filename = true)
+            GROUP BY mmsi
+            HAVING count(DISTINCT filename) > 1
+        )
+        """,
+        [[str(path) for path in outputs]],
+    ).fetchone()[0]
+    assert split_vessels == 0
+
+    preserved = outputs[0]
+    missing = outputs[-1]
+    preserved_mtime = preserved.stat().st_mtime_ns
+    missing.unlink()
+    resumed = _write_track_source_bucket(
+        config,
+        [source],
+        0,
+        tracks_root,
+        "test-source-signature",
+        "test-track-hash",
+        False,
+    )
+    assert len(resumed["outputs"]) == len(outputs)
+    assert missing.exists()
+    assert preserved.stat().st_mtime_ns == preserved_mtime
     assert not list(config.storage.temp_directory.rglob("*"))
+
+
+def test_track_layout_migration_preserves_upstream_and_clears_dependents(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    _write_ports(raw_root / "ports.csv")
+    work_root = tmp_path / "work"
+    config = load_config(_pipeline_config(tmp_path, raw_root, work_root))
+    partition = work_root / "stage02_partitioned" / "sentinel.parquet"
+    static = work_root / "stage02_static" / "vessels.parquet"
+    legacy = work_root / "stage03_tracks" / "mmsi_bucket=0001" / "part.parquet"
+    stale_downstream = [
+        work_root / "stage04_stops" / "mmsi_bucket=0032" / "part.parquet",
+        work_root / "stage05_ports" / "anchors.parquet",
+        work_root / "stage06_port_calls" / "mmsi_bucket=0032" / "port_calls.parquet",
+        work_root / "outputs" / "trajectory_intervals" / "year=2021" / "mmsi_bucket=0032.parquet",
+        work_root / "outputs" / "validation" / "summary.json",
+    ]
+    for path in (partition, static, legacy):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"preserve" if path != legacy else b"legacy")
+    for path in stale_downstream:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale")
+    manifest_path = work_root / "manifests" / "prepare.json"
+    for stage in ("stops", "ports", "calls", "intervals", "validate"):
+        downstream_manifest = work_root / "manifests" / f"{stage}.json"
+        downstream_manifest.parent.mkdir(parents=True, exist_ok=True)
+        downstream_manifest.write_text("{}", encoding="utf-8")
+    manifest = {
+        "stage": "prepare",
+        "items": {
+            "partition:2021-01": {"status": "complete"},
+            "static": {"status": "complete"},
+            "track:0001": {"status": "complete"},
+        },
+    }
+
+    _ensure_track_layout(
+        config,
+        work_root / "stage03_tracks",
+        manifest,
+        manifest_path,
+    )
+
+    marker = json.loads(
+        (work_root / "stage03_tracks" / "_layout.json").read_text(encoding="utf-8")
+    )
+    assert marker["version"] == TRACK_LAYOUT_VERSION
+    assert partition.read_bytes() == b"preserve"
+    assert static.read_bytes() == b"preserve"
+    assert not legacy.exists()
+    assert not any(path.exists() for path in stale_downstream)
+    assert not any(
+        (work_root / "manifests" / f"{stage}.json").exists()
+        for stage in ("stops", "ports", "calls", "intervals", "validate")
+    )
+    assert set(manifest["items"]) == {"partition:2021-01", "static"}
 
 
 def test_diagnostic_classifies_file_multiplication_in_prepare() -> None:
