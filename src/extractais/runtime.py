@@ -15,6 +15,7 @@ from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig
 from extractais.isolated import IsolatedCall, run_isolated_many
 from extractais.progress import StageProgress
+from extractais.storage import GIB, TIB, free_space_bytes
 
 
 def signature(value: Any) -> str:
@@ -81,6 +82,34 @@ def heartbeat(path: Path, phase: str, **values: Any) -> None:
     )
 
 
+def heartbeat_phase_text(state: dict[str, Any]) -> str:
+    def format_size(value: int) -> str:
+        if value >= TIB:
+            return f"{value / TIB:.2f}TiB"
+        if value >= GIB:
+            return f"{value / GIB:.2f}GiB"
+        return f"{value / 1024**2:.2f}MiB"
+
+    phase = str(state.get("phase", "starting"))
+    details: list[str] = []
+    progress_path = state.get("progress_path")
+    if progress_path:
+        try:
+            path = Path(str(progress_path))
+            if path.is_file():
+                details.append(f"out={format_size(path.stat().st_size)}")
+        except OSError:
+            pass
+    space_path = state.get("space_path")
+    if space_path:
+        try:
+            free = free_space_bytes(Path(str(space_path)))
+            details.append(f"free={format_size(free)}")
+        except OSError:
+            pass
+    return " ".join([phase, *details])
+
+
 @dataclass(frozen=True)
 class StageTask:
     key: str
@@ -132,7 +161,7 @@ def run_stage_tasks(
     def poll(active) -> None:
         for key in active:
             state = read_json(by_key[key].heartbeat_path, {})
-            progress.phase(key, str(state.get("phase", "starting")))
+            progress.phase(key, heartbeat_phase_text(state))
         bar.set_postfix_str(progress.render().split("active=", 1)[1])
         bar.refresh()
 

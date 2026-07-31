@@ -9,6 +9,7 @@ import pytest
 from extractais.config import load_config
 from extractais.isolated import IsolatedCall, run_isolated_many
 from extractais.pipeline import run_pipeline
+from extractais.runtime import heartbeat_phase_text
 from extractais.schema import normalized_day_sql
 from extractais.storage import ensure_space
 from test_v2_contract import _config, _ports, _raw_track
@@ -101,6 +102,21 @@ def test_storage_guard_checks_reserve_plus_next_output(tmp_path: Path) -> None:
     free = __import__("shutil").disk_usage(tmp_path).free
     with pytest.raises(RuntimeError, match="Storage guard stopped"):
         ensure_space(tmp_path, free / 1024**3, 1, "test task")
+
+
+def test_track_heartbeat_reports_phase_output_and_free_space(tmp_path: Path) -> None:
+    output = tmp_path / "partition.tmp.parquet"
+    output.write_bytes(b"temporary output")
+    text = heartbeat_phase_text(
+        {
+            "phase": "3/5 trajectory sequencing",
+            "progress_path": str(output),
+            "space_path": str(tmp_path),
+        }
+    )
+    assert text.startswith("3/5 trajectory sequencing")
+    assert "out=0.00MiB" in text
+    assert "free=" in text
 
 
 def test_native_worker_crash_retries_same_task_with_safe_arguments(

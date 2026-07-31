@@ -10,15 +10,16 @@ ExtractAIS 将按日 CSV 形式保存的超大规模 AIS 档案，转换为按 M
 conda env create -f environment.yml
 conda activate extractais
 python -m pip install -e .
-python -c "import extractais; print(extractais.__version__)"
+python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
 ```
 
-版本必须是 `2.0.1`。已有环境升级：
+版本必须是 `ExtractAIS 2.0.2`、`DuckDB 1.5.4`。已有环境升级：
 
 ```powershell
 git pull origin main
 conda activate extractais
-python -m pip install -e .
+python -m pip install --upgrade -e .
+python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
 ```
 
 ## 2. 从旧版迁移
@@ -46,7 +47,7 @@ extractais --config configs/production.yaml inventory
 | `E:\AIS2021-2022\2021,2022` | 原始 CSV，只读 | 永久 |
 | `F:\ExtractAIS-v2` | 偶数轨迹分区 | 永久 |
 | `G:\ExtractAIS-v2` | 奇数轨迹分区 | 永久 |
-| `D:\ExtractAIS-v2-temp` | DuckDB spill、心跳和未提交临时文件 | 成功结束后清空 |
+| `D:\ExtractAIS-v2-temp` | DuckDB spill、心跳、当前分区去重/冲突中间文件 | 成功结束后清空 |
 | `H:\ExtractAIS-v2\products` | 区间、港口调用、静态船舶、验证和检查点 | 永久 |
 | `E:\...\ExtractAIS-v2-evidence`、`I:\ExtractAIS-v2\evidence` | 点到锚点候选和港口上下文 | 永久但可重建 |
 
@@ -87,7 +88,7 @@ extractais --config configs/production.yaml validate
 | 阶段 | 工作内容 | 检查点粒度 |
 |---|---|---|
 | `ingest` | 每个 CSV 解析一次；动态/静态分离；按最终轨迹盘写有序 run | 每日文件 |
-| `tracks` | 全年度 MMSI 排序、精确去重、冲突/异常标记；同时产出静态船舶和停留事件 | 1024 个固定分区 |
+| `tracks` | 分阶段完成精确去重、冲突索引、MMSI 排序和异常标记；同时产出静态船舶和停留事件 | 1024 个固定分区 |
 | `ports` | WPI 清洗、近邻港口组、停留密度锚点和多圆港区 | 分区锚点单元 + 全局目录 |
 | `geometry` | AIS 点/停留事件到锚点的精确距离证据 | 固定分区 |
 | `calls` | 将锚点映射到当前港口组并确认港口调用 | 固定分区 |
@@ -99,10 +100,12 @@ extractais --config configs/production.yaml validate
 进度条只按已经原子提交并写入 SQLite 的源字节推进，不把扫描中的估算字节当作完成量。例如：
 
 ```text
-tracks: 18%|...| 146G/812G [03:10:22, active=0042:sorting ETA 14:21:08]
+tracks: 85%|...| 452G/535G [28:08:05, active=0866:3/5 trajectory sequencing out=0.31GiB free=8.42TiB ETA 10:12:30]
 ```
 
 - `active=分区:阶段` 每 5 秒从子进程心跳更新，即使百分比暂时不变也能看到任务在做什么。
+- `tracks` 的内部阶段固定为 `1/5 exact deduplication`、`2/5 time conflict index`、`3/5 trajectory sequencing`、`4/5 stop event detection` 和 `5/5 vessel static compaction`。
+- `out` 是当前阶段已经写出的临时文件大小，`free` 是该阶段目标盘实时可用空间；二者变化可用于区分长查询与停滞。
 - ETA 至少完成 3 个工作单元后才显示；此前显示 `ETA calibrating n/3`。
 - ETA 基于已提交工作单元的实际字节吞吐，不使用“首个任务瞬间完成”造成的虚假速度。
 - 一个分区可能运行较久，百分比只在它提交后跳动，这是提交语义，不是停滞。
@@ -116,6 +119,22 @@ extractais --config configs/production.yaml status --json
 ```
 
 SQLite 检查点位于 `H:\ExtractAIS-v2\products\metadata\state.sqlite`。
+
+### 从 2.0.1 的 tracks 原生崩溃恢复
+
+若日志包含 `0xC0000005` 且活动阶段为 `sorting canonical trajectory`，不要删除任何输出、`ingest_runs` 或 `state.sqlite`。停止旧进程后执行：
+
+```powershell
+git pull origin main
+conda activate extractais
+python -m pip install --upgrade -e .
+python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
+extractais --config configs/production.yaml status
+extractais --config configs/production.yaml run-all 2>&1 |
+  Tee-Object -FilePath logs/run-all-v2-resume.log
+```
+
+应输出 `2.0.2 1.5.4`。2.0.2 保持 `tracks` 的任务签名和最终 Parquet 契约不变，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
 
 ## 6. 最终区间字段
 
@@ -167,7 +186,7 @@ products/validation/ambiguous_port_points.parquet
 
 ## 8. 可删除内容
 
-- `D:\ExtractAIS-v2-temp`：运行未进行时可删除；成功的 `run-all` 会自动清空。
+- `D:\ExtractAIS-v2-temp`：包含当前活动轨迹分区的去重/冲突中间文件和 DuckDB spill；运行未进行时可删除，成功的 `run-all` 会自动清空。
 - `*/ingest_runs`：全部 tracks 完成后自动删除，也可用 `cleanup-staging`；命令会先验证全部轨迹检查点。
 - `point_anchor_candidates`、`port_context`：属于可重建证据，但删除后 `status` 会识别输出缺失；后续阶段不能独立复用。
 - `products/validation`：可重建报告。

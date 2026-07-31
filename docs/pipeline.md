@@ -38,7 +38,7 @@ All source fields are initially read as text. Sentinels become null, timestamps/
 
 ### Canonical tracks
 
-Each of 1024 tasks reads only the sorted daily runs for its final partition. It performs the archive-wide MMSI/time ordering once, removes exact duplicates, retains same-time coordinate conflicts as evidence, computes sequence/gap/step/implied-speed flags, and writes canonical Parquet. Stop events and latest non-null static vessel attributes are produced inside the same bounded task. After all 1024 outputs are committed, daily ingest runs are deleted.
+Each of 1024 tasks reads only the sorted daily runs for its final partition. The task uses five bounded phases: exact deduplication, same-time conflict indexing, MMSI/time sequencing and canonical output, stop-event detection, and static-vessel compaction. Deduplicated points and the conflict index are temporary Parquet files. Every phase uses a fresh DuckDB connection and spill directory, so window-sort memory and native state are released before the next phase. The final schema and task signature are unchanged from v2.0.1. After all 1024 outputs are committed, daily ingest runs are deleted.
 
 ### Anchors and groups
 
@@ -80,7 +80,7 @@ Signatures propagate through dependency file identities. Geometry depends on anc
 
 Permanent: canonical tracks, compact vessel static data, stop events, port/anchor catalogs, geometry evidence, port calls, trajectory intervals, validation reports, input inventory, and `state.sqlite`.
 
-Temporary: DuckDB spill directories, heartbeat JSON, `.tmp.parquet`, and ingest sorted runs. Temporary files are scoped to one task. A successful full pipeline removes the temp root; ingest runs are removed only after all tracks validate.
+Temporary: DuckDB spill directories, heartbeat JSON, per-partition deduplicated/conflict Parquet, `.tmp.parquet`, and ingest sorted runs. Temporary files are scoped to one task. A successful full pipeline removes the temp root; ingest runs are removed only after all tracks validate.
 
 ## Validation contract
 

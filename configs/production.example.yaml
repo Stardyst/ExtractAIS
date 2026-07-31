@@ -12,7 +12,7 @@ storage:
   track_roots:
     - "F:/ExtractAIS-v2"
     - "G:/ExtractAIS-v2"
-  # D is NVMe and contains only DuckDB spill, heartbeats, and atomic temp files.
+  # D is NVMe and contains DuckDB spill, heartbeats, and active track-phase files.
   temp_root: "D:/ExtractAIS-v2-temp"
   # H stores compact retained products. H-I are one physical disk, so H is not
   # counted as an additional concurrent compute lane.

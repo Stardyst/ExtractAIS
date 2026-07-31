@@ -33,7 +33,12 @@ def _temporary(path: Path) -> Path:
     return path.with_name(path.stem + ".tmp" + path.suffix)
 
 
-def _canonical_sql(config: AppConfig, dynamic_paths: list[Path], partition: int) -> str:
+def _reference_canonical_sql(
+    config: AppConfig,
+    dynamic_paths: list[Path],
+    partition: int,
+) -> str:
+    """Preserve the v2.0.1 query as the staged-output regression oracle."""
     source = parquet_sources(dynamic_paths)
     distance = haversine_km(
         "previous_latitude", "previous_longitude", "latitude", "longitude"
@@ -106,7 +111,104 @@ def _canonical_sql(config: AppConfig, dynamic_paths: list[Path], partition: int)
     """
 
 
-def _stop_sql(config: AppConfig, partition: int) -> str:
+def _deduplicated_sql(dynamic_paths: list[Path], partition: int) -> str:
+    source = parquet_sources(dynamic_paths)
+    return f"""
+        WITH selected AS (
+            SELECT *
+            FROM {source}
+            WHERE track_partition_id = {partition}
+        ),
+        exact_ranked AS (
+            SELECT
+                *,
+                row_number() OVER (
+                    PARTITION BY mmsi, timestamp_utc, latitude, longitude
+                    ORDER BY source_at_dock DESC NULLS LAST, msg_type, msg_id NULLS LAST
+                ) AS exact_rank
+            FROM selected
+        )
+        SELECT * EXCLUDE (exact_rank)
+        FROM exact_ranked
+        WHERE exact_rank = 1
+    """
+
+
+def _conflict_sql(deduplicated_path: Path) -> str:
+    source = parquet_sources([deduplicated_path])
+    return f"""
+        SELECT mmsi, timestamp_utc
+        FROM {source}
+        GROUP BY mmsi, timestamp_utc
+        HAVING count(*) > 1
+    """
+
+
+def _sequenced_sql(
+    config: AppConfig,
+    deduplicated_path: Path,
+    conflict_path: Path,
+) -> str:
+    deduplicated = parquet_sources([deduplicated_path])
+    conflicts = parquet_sources([conflict_path])
+    distance = haversine_km(
+        "previous_latitude", "previous_longitude", "latitude", "longitude"
+    )
+    return f"""
+        WITH conflict_marked AS (
+            SELECT
+                points.*,
+                conflict_times.mmsi IS NOT NULL AS is_time_conflict
+            FROM {deduplicated} AS points
+            LEFT JOIN {conflicts} AS conflict_times
+                USING (mmsi, timestamp_utc)
+        ),
+        sequenced AS (
+            SELECT
+                *,
+                row_number() OVER vessel_order AS point_seq,
+                lag(timestamp_utc) OVER vessel_order AS previous_timestamp_utc,
+                lag(latitude) OVER vessel_order AS previous_latitude,
+                lag(longitude) OVER vessel_order AS previous_longitude
+            FROM conflict_marked
+            WINDOW vessel_order AS (
+                PARTITION BY mmsi ORDER BY timestamp_utc, latitude, longitude
+            )
+        ),
+        measured AS (
+            SELECT
+                *,
+                date_diff('second', previous_timestamp_utc, timestamp_utc)
+                    AS gap_seconds,
+                CASE WHEN previous_timestamp_utc IS NOT NULL THEN {distance} END
+                    AS step_distance_km
+            FROM sequenced
+        ),
+        speeds AS (
+            SELECT
+                *,
+                CASE WHEN gap_seconds > 0
+                     THEN step_distance_km / gap_seconds * 3600.0 / 1.852 END
+                    AS implied_speed_knots
+            FROM measured
+        )
+        SELECT
+            * EXCLUDE (
+                previous_timestamp_utc, previous_latitude, previous_longitude
+            ),
+            coalesce(
+                implied_speed_knots > {config.cleaning.max_implied_speed_knots},
+                false
+            ) AS is_kinematic_outlier
+        FROM speeds
+    """
+
+
+def _stop_sql(
+    config: AppConfig,
+    partition: int,
+    track_source: str = "canonical_tracks",
+) -> str:
     diameter = haversine_km(
         "min_latitude", "min_longitude", "max_latitude", "max_longitude"
     )
@@ -121,7 +223,7 @@ def _stop_sql(config: AppConfig, partition: int) -> str:
                         AND coalesce(step_distance_km <= {config.stops.max_step_km}, false)
                     )
                 ) AS is_stop_candidate
-            FROM canonical_tracks
+            FROM {track_source}
             WHERE NOT is_kinematic_outlier
         ),
         previous AS (
@@ -189,6 +291,47 @@ def _stop_sql(config: AppConfig, partition: int) -> str:
     """
 
 
+def _copy_phase(
+    config: AppConfig,
+    worker_temp: Path,
+    heartbeat_path: Path,
+    *,
+    phase_index: int,
+    phase_total: int,
+    phase_key: str,
+    label: str,
+    select_sql: str,
+    output_path: Path,
+    order_by: str | None,
+    space_path: Path,
+) -> int:
+    spill = worker_temp / f"spill-{phase_key}"
+    shutil.rmtree(spill, ignore_errors=True)
+    output_path.unlink(missing_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat(
+        heartbeat_path,
+        f"{phase_index}/{phase_total} {label}",
+        progress_path=str(output_path.resolve()),
+        space_path=str(space_path.resolve()),
+    )
+    connection = open_database(config, spill, worker=True)
+    try:
+        return int(
+            connection.execute(
+                parquet_copy_sql(
+                    select_sql,
+                    output_path,
+                    config,
+                    order_by=order_by,
+                )
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+        shutil.rmtree(spill, ignore_errors=True)
+
+
 def _vessel_sql(static_paths: list[Path], partition: int) -> str:
     source = parquet_sources(static_paths)
     return f"""
@@ -230,76 +373,148 @@ def _track_worker(
     static_paths: list[Path],
     outputs: tuple[Path, Path, Path],
     heartbeat_path: Path,
+    estimated_source_bytes: int | None = None,
 ) -> dict[str, int]:
     track_output, stop_output, vessel_output = outputs
     temporary_outputs = tuple(_temporary(path) for path in outputs)
     worker_temp = config.storage.temp_root / f"tracks-{partition:04d}"
+    deduplicated_path = worker_temp / "deduplicated.parquet"
+    conflict_path = worker_temp / "time_conflicts.parquet"
+    phase_total = 5
     shutil.rmtree(worker_temp, ignore_errors=True)
     for path in temporary_outputs:
         path.unlink(missing_ok=True)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    source_bytes = total_file_size(dynamic_paths) // config.layout.track_partitions
+    source_bytes = estimated_source_bytes
+    if source_bytes is None:
+        source_bytes = total_file_size(dynamic_paths) // config.layout.track_partitions
+    source_bytes = max(int(source_bytes), 1024**2)
+    materialized_bytes = shared_output_requirement(config, source_bytes * 2)
     ensure_space(
         config.storage.temp_root,
         config.storage.reserves_gib["temp"],
-        shared_temp_requirement(config),
+        shared_temp_requirement(config) + materialized_bytes,
         f"track partition {partition:04d} temporary data",
     )
     ensure_space(
         track_output,
         config.storage.reserves_gib["tracks"],
-        max(source_bytes * 2, 1024**2),
+        source_bytes * 2,
         f"track partition {partition:04d}",
     )
     ensure_space(
         config.storage.products_root,
         config.storage.reserves_gib["products"],
-        shared_output_requirement(config, max(source_bytes, 1024**2)),
+        shared_output_requirement(config, source_bytes),
         f"track products {partition:04d}",
     )
 
-    connection = open_database(config, worker_temp, worker=True)
     try:
-        heartbeat(heartbeat_path, "sorting canonical trajectory")
-        connection.execute(
-            f"CREATE TEMP TABLE canonical_tracks AS {_canonical_sql(config, dynamic_paths, partition)}"
+        ensure_space(
+            config.storage.temp_root,
+            config.storage.reserves_gib["temp"],
+            shared_temp_requirement(config) + materialized_bytes,
+            f"track partition {partition:04d} exact deduplication",
         )
-        heartbeat(heartbeat_path, "writing canonical trajectory")
-        track_rows = int(
-            connection.execute(
-                parquet_copy_sql(
-                    "SELECT * FROM canonical_tracks",
-                    temporary_outputs[0],
-                    config,
-                    order_by="mmsi, point_seq",
-                )
-            ).fetchone()[0]
+        deduplicated_rows = _copy_phase(
+            config,
+            worker_temp,
+            heartbeat_path,
+            phase_index=1,
+            phase_total=phase_total,
+            phase_key="deduplicate",
+            label="exact deduplication",
+            select_sql=_deduplicated_sql(dynamic_paths, partition),
+            output_path=deduplicated_path,
+            order_by=None,
+            space_path=config.storage.temp_root,
         )
-        heartbeat(heartbeat_path, "detecting stop events")
-        stop_rows = int(
-            connection.execute(
-                parquet_copy_sql(
-                    _stop_sql(config, partition),
-                    temporary_outputs[1],
-                    config,
-                    order_by="mmsi, start_time_utc",
-                )
-            ).fetchone()[0]
+
+        ensure_space(
+            config.storage.temp_root,
+            config.storage.reserves_gib["temp"],
+            shared_temp_requirement(config) + materialized_bytes,
+            f"track partition {partition:04d} conflict index",
         )
-        heartbeat(heartbeat_path, "compacting static messages")
-        vessel_rows = int(
-            connection.execute(
-                parquet_copy_sql(
-                    _vessel_sql(static_paths, partition),
-                    temporary_outputs[2],
-                    config,
-                    order_by="mmsi",
-                )
-            ).fetchone()[0]
+        conflict_rows = _copy_phase(
+            config,
+            worker_temp,
+            heartbeat_path,
+            phase_index=2,
+            phase_total=phase_total,
+            phase_key="conflicts",
+            label="time conflict index",
+            select_sql=_conflict_sql(deduplicated_path),
+            output_path=conflict_path,
+            order_by=None,
+            space_path=config.storage.temp_root,
+        )
+
+        ensure_space(
+            track_output,
+            config.storage.reserves_gib["tracks"],
+            source_bytes * 2,
+            f"track partition {partition:04d} canonical output",
+        )
+        track_rows = _copy_phase(
+            config,
+            worker_temp,
+            heartbeat_path,
+            phase_index=3,
+            phase_total=phase_total,
+            phase_key="sequence",
+            label="trajectory sequencing",
+            select_sql=_sequenced_sql(config, deduplicated_path, conflict_path),
+            output_path=temporary_outputs[0],
+            order_by="mmsi, point_seq",
+            space_path=track_output,
+        )
+
+        ensure_space(
+            config.storage.products_root,
+            config.storage.reserves_gib["products"],
+            shared_output_requirement(config, source_bytes),
+            f"track partition {partition:04d} stop events",
+        )
+        stop_rows = _copy_phase(
+            config,
+            worker_temp,
+            heartbeat_path,
+            phase_index=4,
+            phase_total=phase_total,
+            phase_key="stops",
+            label="stop event detection",
+            select_sql=_stop_sql(
+                config,
+                partition,
+                parquet_sources([temporary_outputs[0]]),
+            ),
+            output_path=temporary_outputs[1],
+            order_by="mmsi, start_time_utc",
+            space_path=config.storage.products_root,
+        )
+
+        ensure_space(
+            config.storage.products_root,
+            config.storage.reserves_gib["products"],
+            shared_output_requirement(config, source_bytes),
+            f"track partition {partition:04d} vessel static output",
+        )
+        vessel_rows = _copy_phase(
+            config,
+            worker_temp,
+            heartbeat_path,
+            phase_index=5,
+            phase_total=phase_total,
+            phase_key="vessels",
+            label="vessel static compaction",
+            select_sql=_vessel_sql(static_paths, partition),
+            output_path=temporary_outputs[2],
+            order_by="mmsi",
+            space_path=config.storage.products_root,
         )
     finally:
-        connection.close()
         shutil.rmtree(worker_temp, ignore_errors=True)
 
     heartbeat(heartbeat_path, "committing")
@@ -308,6 +523,8 @@ def _track_worker(
     heartbeat(heartbeat_path, "committed")
     return {
         "row_count": track_rows,
+        "deduplicated_count": deduplicated_rows,
+        "conflict_count": conflict_rows,
         "stop_count": stop_rows,
         "vessel_count": vessel_rows,
         "output_bytes": sum(path.stat().st_size for path in outputs),
@@ -383,6 +600,7 @@ def build_tracks(
                         static_paths,
                         outputs,
                         heartbeat_path,
+                        weights[partition],
                     ),
                     resource=str(lane_for_partition(config, partition)),
                 ),
