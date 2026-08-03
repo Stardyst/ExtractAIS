@@ -33,6 +33,8 @@ runtime:
   workers_per_track_root: 1
   worker_threads: 6
   worker_memory: "40GB"
+  # Per-worker DuckDB spill ceiling. Geometry now uses bounded 64-way edge
+  # compaction; do not increase this to compensate for an unbounded query.
   worker_temp_gib: 180
   progress_interval_seconds: 5
   enable_progress: true

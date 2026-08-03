@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from extractais import __version__
-from extractais.calls import group_candidate_path
 from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig
 from extractais.database import open_database, parquet_copy_sql, sql_literal
@@ -53,8 +52,7 @@ def _validation_partial_worker(
     ]
     calls = port_call_path(config, partition)
     context = port_context_path(config, partition)
-    group_candidates = group_candidate_path(config, partition)
-    source_bytes = total_file_size([*intervals, calls, context, group_candidates])
+    source_bytes = total_file_size([*intervals, calls, context])
     ensure_space(
         config.storage.products_root,
         config.storage.reserves_gib["products"],
@@ -119,17 +117,13 @@ def _validation_partial_worker(
                 parquet_copy_sql(
                     f"""
                     SELECT
-                        c.mmsi, c.point_seq, c.timestamp_utc,
-                        c.latitude, c.longitude,
+                        x.mmsi, x.point_seq, x.timestamp_utc,
+                        x.latitude, x.longitude,
                         x.port_group_id, x.port_group_name,
                         x.second_port_group_id, x.second_port_group_name,
                         x.port_distance_km, x.second_port_distance_km,
                         x.ambiguity_margin_km, x.track_partition_id
                     FROM {parquet_sources([context])} x
-                    JOIN {parquet_sources([group_candidates])} c
-                      ON x.mmsi = c.mmsi
-                     AND x.point_seq = c.point_seq
-                     AND c.candidate_rank = 1
                     WHERE x.ambiguity_margin_km < {config.ports.ambiguity_margin_km}
                     """,
                     temporary_outputs[2],
@@ -272,7 +266,6 @@ def build_validation(config: AppConfig, store: CheckpointStore) -> None:
         dependencies = [
             port_call_path(config, partition),
             port_context_path(config, partition),
-            group_candidate_path(config, partition),
             *[
                 interval_path(config, year, partition)
                 for year in sorted(config.input.year_directories)

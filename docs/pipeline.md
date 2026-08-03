@@ -1,4 +1,4 @@
-# ExtractAIS v2 processing contract
+# ExtractAIS v2.1 processing contract
 
 ## Invariants
 
@@ -22,7 +22,7 @@ flowchart LR
   TR --> ST["Stop events"]
   ST --> AN["Observed multi-circle anchors"]
   WPI["WPI port catalog"] --> PG["Independent port groups"]
-  TR --> GE["Point-anchor geometry on E/I"]
+  TR --> GE["Compact point-port geometry on E/I"]
   AN --> GE
   GE --> CA["Confirmed port calls"]
   PG --> CA
@@ -48,7 +48,7 @@ WPI ports within `group_distance_km` form connected components. Every member sta
 
 ### Geometry and calls
 
-A coarse tile join narrows candidates, then Haversine distance determines every point-to-anchor candidate within the approach radius. The complete ranked candidate evidence is retained. Calls map anchor candidates through the current port catalog/groups and require an approach episode with entry evidence and an independently detected stop overlap.
+A coarse tile join and Haversine distance first produce compact point-anchor edges in 64 temporary hash shards. Each shard is reduced to the nearest anchor for every `(point, WPI port)` pair, then the raw edge shard is deleted. This reduction is exact for every future port grouping because the minimum over a group equals the minimum of its member-port minima. Calls map the compact WPI-port candidates through the current groups, retain the first and second group distances, and require an approach episode with entry evidence and an independently detected stop overlap.
 
 ### Intervals
 
@@ -88,7 +88,7 @@ Before excluding small ports, retain and compare:
 
 - WPI group membership, country/area membership, cross-border flag, and Harbor Size;
 - anchor support, vessel support, nearest WPI distance, and unmatched qualified cells;
-- every point-to-anchor and point-to-group candidate distance;
+- every point-to-WPI-port nearest-anchor distance and point-to-group candidate distance;
 - first/second candidate margin and ambiguity flag;
 - call entry/exit/stop evidence;
 - port and Harbor Size coverage, calling vessels, and ambiguity rates;

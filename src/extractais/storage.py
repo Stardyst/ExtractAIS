@@ -41,7 +41,11 @@ def stop_path(config: AppConfig, partition: int) -> Path:
 
 
 def candidate_path(config: AppConfig, partition: int) -> Path:
-    return evidence_root_for_partition(config, partition) / "point_anchor_candidates" / f"partition={partition:04d}.parquet"
+    return (
+        evidence_root_for_partition(config, partition)
+        / "point_port_candidates"
+        / f"partition={partition:04d}.parquet"
+    )
 
 
 def port_context_path(config: AppConfig, partition: int) -> Path:

@@ -40,6 +40,7 @@ def _calls_worker(
 ) -> dict[str, int]:
     point_candidates = candidate_path(config, partition)
     stop_matches = stop_anchor_match_path(config, partition)
+    track = track_path(config, partition)
     ports_root = config.storage.products_root / "ports"
     anchors = ports_root / "anchors.parquet"
     catalog = ports_root / "port_catalog.parquet"
@@ -80,32 +81,34 @@ def _calls_worker(
                     c.*,
                     p.port_group_id,
                     p.port_group_name,
-                    g.country_or_area_name AS port_country_or_area,
-                    a.nearest_port_id
+                    g.country_or_area_name AS port_country_or_area
                 FROM {parquet_sources([point_candidates])} c
-                JOIN {parquet_sources([anchors])} a USING (anchor_id)
                 JOIN {parquet_sources([catalog])} p
-                  ON a.nearest_port_id = p.port_id
+                  ON c.nearest_port_id = p.port_id
                 JOIN {parquet_sources([groups])} g USING (port_group_id)
             ),
             by_group AS (
                 SELECT
-                    mmsi, point_seq, timestamp_utc, latitude, longitude, speed,
-                    source_at_dock, gap_seconds, matched_port_name,
-                    source_label, source_sublabel, collection_type, source,
-                    track_partition_id, port_group_id,
+                    mmsi, point_seq,
+                    min(timestamp_utc) AS timestamp_utc,
+                    min(track_partition_id)::INTEGER AS track_partition_id,
+                    port_group_id,
                     arg_min(port_group_name, anchor_distance_km) AS port_group_name,
                     arg_min(port_country_or_area, anchor_distance_km)
                         AS port_country_or_area,
-                    arg_min(anchor_id, anchor_distance_km) AS nearest_anchor_id,
-                    arg_min(nearest_port_id, anchor_distance_km) AS nearest_port_id,
+                    arg_min(nearest_anchor_id, struct_pack(
+                        distance := anchor_distance_km,
+                        port := nearest_port_id,
+                        anchor := nearest_anchor_id
+                    )) AS nearest_anchor_id,
+                    arg_min(nearest_port_id, struct_pack(
+                        distance := anchor_distance_km,
+                        port := nearest_port_id,
+                        anchor := nearest_anchor_id
+                    )) AS nearest_port_id,
                     min(anchor_distance_km) AS port_distance_km
                 FROM mapped
-                GROUP BY
-                    mmsi, point_seq, timestamp_utc, latitude, longitude, speed,
-                    source_at_dock, gap_seconds, matched_port_name,
-                    source_label, source_sublabel, collection_type, source,
-                    track_partition_id, port_group_id
+                GROUP BY mmsi, point_seq, port_group_id
             )
             SELECT
                 *,
@@ -122,7 +125,6 @@ def _calls_worker(
                     "SELECT * FROM group_candidates",
                     temporary_outputs[0],
                     config,
-                    order_by="mmsi, point_seq, candidate_rank",
                 )
             ).fetchone()[0]
         )
@@ -130,14 +132,10 @@ def _calls_worker(
         heartbeat(heartbeat_path, "building compact point context")
         connection.execute(
             """
-            CREATE TEMP TABLE port_context AS
+            CREATE TEMP TABLE candidate_context AS
             SELECT
                 mmsi,
                 point_seq,
-                arg_min(timestamp_utc, candidate_rank) AS timestamp_utc,
-                arg_min(source_at_dock, candidate_rank) AS source_at_dock,
-                arg_min(matched_port_name, candidate_rank) AS matched_port_name,
-                arg_min(track_partition_id, candidate_rank) AS track_partition_id,
                 arg_min(port_group_id, candidate_rank) AS port_group_id,
                 arg_min(port_group_name, candidate_rank) AS port_group_name,
                 arg_min(port_country_or_area, candidate_rank) AS port_country_or_area,
@@ -158,6 +156,32 @@ def _calls_worker(
             FROM group_candidates
             WHERE candidate_rank <= 2
             GROUP BY mmsi, point_seq
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE port_context AS
+            SELECT
+                t.mmsi,
+                t.point_seq,
+                t.timestamp_utc,
+                t.latitude,
+                t.longitude,
+                t.source_at_dock,
+                t.matched_port_name,
+                t.track_partition_id,
+                c.port_group_id,
+                c.port_group_name,
+                c.port_country_or_area,
+                c.nearest_anchor_id,
+                c.second_port_group_id,
+                c.second_port_group_name,
+                c.second_port_country_or_area,
+                c.port_distance_km,
+                c.second_port_distance_km,
+                c.ambiguity_margin_km
+            FROM {parquet_sources([track])} t
+            JOIN candidate_context c USING (mmsi, point_seq)
             """
         )
         context_count = int(
@@ -304,6 +328,7 @@ def build_calls(config: AppConfig, store: CheckpointStore) -> None:
     for partition in range(config.layout.track_partitions):
         candidates = candidate_path(config, partition)
         stop_matches = stop_anchor_match_path(config, partition)
+        track = track_path(config, partition)
         outputs = (
             group_candidate_path(config, partition),
             port_context_path(config, partition),
@@ -316,6 +341,8 @@ def build_calls(config: AppConfig, store: CheckpointStore) -> None:
                 candidates.stat().st_mtime_ns,
                 stop_matches.stat().st_size,
                 stop_matches.stat().st_mtime_ns,
+                track.stat().st_size,
+                track.stat().st_mtime_ns,
             ]
         )
         beat = config.storage.temp_root / "heartbeats" / f"calls-{partition:04d}.json"
@@ -323,7 +350,12 @@ def build_calls(config: AppConfig, store: CheckpointStore) -> None:
             StageTask(
                 key=f"{partition:04d}",
                 signature=task_signature,
-                source_bytes=max(1, candidates.stat().st_size + stop_matches.stat().st_size),
+                source_bytes=max(
+                    1,
+                    candidates.stat().st_size
+                    + stop_matches.stat().st_size
+                    + track.stat().st_size,
+                ),
                 outputs=outputs,
                 heartbeat_path=beat,
                 call=IsolatedCall(

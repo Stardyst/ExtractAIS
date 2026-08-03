@@ -54,9 +54,9 @@ def test_port_group_change_reuses_geometry(tmp_path: Path) -> None:
     config_path, config = _sample(tmp_path)
     run_pipeline(config, tmp_path)
     geometry = next(
-        (root / "point_anchor_candidates" / "partition=0000.parquet")
+        (root / "point_port_candidates" / "partition=0000.parquet")
         for root in config.storage.evidence_roots
-        if (root / "point_anchor_candidates" / "partition=0000.parquet").exists()
+        if (root / "point_port_candidates" / "partition=0000.parquet").exists()
     )
     interval = config.storage.products_root / "trajectory_intervals" / "year=2021" / "partition=0000.parquet"
     before_geometry = geometry.stat().st_mtime_ns
@@ -116,6 +116,19 @@ def test_track_heartbeat_reports_phase_output_and_free_space(tmp_path: Path) -> 
     )
     assert text.startswith("3/5 trajectory sequencing")
     assert "out=0.00MiB" in text
+    assert "free=" in text
+
+
+def test_heartbeat_reports_directory_progress_bytes(tmp_path: Path) -> None:
+    text = heartbeat_phase_text(
+        {
+            "phase": "2/4 compacting point-port shard 17/64",
+            "progress_bytes": 3 * 1024**3,
+            "space_path": str(tmp_path),
+        }
+    )
+    assert text.startswith("2/4 compacting point-port shard 17/64")
+    assert "out=3.00GiB" in text
     assert "free=" in text
 
 

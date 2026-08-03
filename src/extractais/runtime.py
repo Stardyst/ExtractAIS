@@ -92,6 +92,12 @@ def heartbeat_phase_text(state: dict[str, Any]) -> str:
 
     phase = str(state.get("phase", "starting"))
     details: list[str] = []
+    progress_bytes = state.get("progress_bytes")
+    if progress_bytes is not None:
+        try:
+            details.append(f"out={format_size(max(0, int(progress_bytes)))}")
+        except (TypeError, ValueError):
+            pass
     progress_path = state.get("progress_path")
     if progress_path:
         try:

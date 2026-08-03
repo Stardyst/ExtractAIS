@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("ingest", help="normalize each raw file once into sorted lane runs")
     commands.add_parser("tracks", help="build canonical tracks, vessels, and stop events")
     commands.add_parser("ports", help="build multi-circle anchors and independent port groups")
-    commands.add_parser("geometry", help="calculate point-to-anchor evidence")
+    commands.add_parser("geometry", help="calculate compact point-to-port geometry evidence")
     commands.add_parser("calls", help="confirm port calls from geometry and port groups")
     commands.add_parser("intervals", help="build annual five-state trajectory intervals")
     commands.add_parser("validate", help="build accuracy evidence and quality summaries")
@@ -117,7 +117,7 @@ def _print_status(status: dict[str, object], as_json: bool) -> None:
     if as_json:
         print(json.dumps(status, ensure_ascii=False, indent=2))
         return
-    print("ExtractAIS 2.0 status")
+    print(f"ExtractAIS {__version__} status")
     print(f"Track partitions: {status['track_partitions']}")
     print("Checkpoints:")
     for stage, count in status["checkpoints"].items():

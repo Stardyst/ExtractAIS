@@ -1,4 +1,4 @@
-# ExtractAIS 2.0
+# ExtractAIS 2.1
 
 ExtractAIS 将按日 CSV 形式保存的超大规模 AIS 档案，转换为按 MMSI 和时间排序的年度船舶运行区间。v2 是不兼容重构：原始 CSV 每日只解析一次，动态信息和静态信息立即分离；船舶全量排序只执行一次；重任务按固定 MMSI 分区分布到独立物理盘。
 
@@ -13,7 +13,7 @@ python -m pip install -e .
 python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
 ```
 
-版本必须是 `ExtractAIS 2.0.2`、`DuckDB 1.5.4`。已有环境升级：
+版本必须是 `ExtractAIS 2.1.0`、`DuckDB 1.5.4`。已有环境升级：
 
 ```powershell
 git pull origin main
@@ -49,7 +49,7 @@ extractais --config configs/production.yaml inventory
 | `G:\ExtractAIS-v2` | 奇数轨迹分区 | 永久 |
 | `D:\ExtractAIS-v2-temp` | DuckDB spill、心跳、当前分区去重/冲突中间文件 | 成功结束后清空 |
 | `H:\ExtractAIS-v2\products` | 区间、港口调用、静态船舶、验证和检查点 | 永久 |
-| `E:\...\ExtractAIS-v2-evidence`、`I:\ExtractAIS-v2\evidence` | 点到锚点候选和港口上下文 | 永久但可重建 |
+| `E:\...\ExtractAIS-v2-evidence`、`I:\ExtractAIS-v2\evidence` | 点到 WPI 港口的最近锚点证据和港口上下文 | 永久但可重建 |
 
 `H` 到 `L` 属于同一物理盘，不能把不同盘符当成额外并行磁盘。`F/G` 各自只运行一个重型任务；每个任务内部使用 6 个 DuckDB 线程和 40 GB 上限。不要将 `workers_per_track_root` 改为 2。
 
@@ -90,8 +90,8 @@ extractais --config configs/production.yaml validate
 | `ingest` | 每个 CSV 解析一次；动态/静态分离；按最终轨迹盘写有序 run | 每日文件 |
 | `tracks` | 分阶段完成精确去重、冲突索引、MMSI 排序和异常标记；同时产出静态船舶和停留事件 | 1024 个固定分区 |
 | `ports` | WPI 清洗、近邻港口组、停留密度锚点和多圆港区 | 分区锚点单元 + 全局目录 |
-| `geometry` | AIS 点/停留事件到锚点的精确距离证据 | 固定分区 |
-| `calls` | 将锚点映射到当前港口组并确认港口调用 | 固定分区 |
+| `geometry` | 分片计算每个 AIS 点到各 WPI 港口的最近锚点证据 | 固定分区 |
+| `calls` | 将 WPI 港口候选映射到当前港口组并确认港口调用 | 固定分区 |
 | `intervals` | 五状态分类、长中断、连续状态压缩、年度裁切 | 固定分区 |
 | `validate` | 港口覆盖、歧义、Harbor Size、状态和证据汇总 | 固定分区 + 全局汇总 |
 
@@ -105,6 +105,7 @@ tracks: 85%|...| 452G/535G [28:08:05, active=0866:3/5 trajectory sequencing out=
 
 - `active=分区:阶段` 每 5 秒从子进程心跳更新，即使百分比暂时不变也能看到任务在做什么。
 - `tracks` 的内部阶段固定为 `1/5 exact deduplication`、`2/5 time conflict index`、`3/5 trajectory sequencing`、`4/5 stop event detection` 和 `5/5 vessel static compaction`。
+- `geometry` 依次显示锚点边分片、`point-port shard n/N` 压缩、紧凑候选合并和停留事件匹配。前两步的 `out` 是 D 盘当前临时边/紧凑分片大小。
 - `out` 是当前阶段已经写出的临时文件大小，`free` 是该阶段目标盘实时可用空间；二者变化可用于区分长查询与停滞。
 - ETA 至少完成 3 个工作单元后才显示；此前显示 `ETA calibrating n/3`。
 - ETA 基于已提交工作单元的实际字节吞吐，不使用“首个任务瞬间完成”造成的虚假速度。
@@ -134,7 +135,30 @@ extractais --config configs/production.yaml run-all 2>&1 |
   Tee-Object -FilePath logs/run-all-v2-resume.log
 ```
 
-应输出 `2.0.2 1.5.4`。2.0.2 保持 `tracks` 的任务签名和最终 Parquet 契约不变，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
+应输出 `2.1.0 1.5.4`。2.1.0 保持 `tracks` 的任务签名和最终 Parquet 契约不变，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
+
+### 从 2.0.2 的 geometry 候选爆炸恢复
+
+2.0.2 为每个 AIS 点永久保存 10 km 内的全部锚点，并对候选全局排序。生产样本中单个 `0.877 GiB` 分区产生了 `16.28 亿` 条记录、`10.969 GiB` 输出和超过 `180 GiB` DuckDB spill。2.1.0 改为 64 个临时边分片，并在不依赖港口组的前提下只保留每个 WPI 港口的最近锚点。
+
+升级后直接执行：
+
+```powershell
+git pull origin main
+conda activate extractais
+python -m pip install --upgrade -e .
+python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
+extractais --config configs/production.yaml geometry
+```
+
+`ingest`、`tracks` 和 `ports` 检查点会完整复用；geometry 的新路径和契约版本会使旧 geometry 检查点失效，随后 `calls`、`intervals`、`validate` 自动重建。确认没有运行中的 ExtractAIS 进程后，2.0.2 遗留的以下目录可以删除：
+
+```powershell
+Remove-Item -LiteralPath "E:\AIS2021-2022\ExtractAIS-v2-evidence\point_anchor_candidates" -Recurse
+Remove-Item -LiteralPath "I:\ExtractAIS-v2\evidence\point_anchor_candidates" -Recurse
+```
+
+执行前必须逐一核对绝对路径。2.1.0 的新证据目录名为 `point_port_candidates`，不在删除范围内。
 
 ## 6. 最终区间字段
 
@@ -169,7 +193,7 @@ H:\ExtractAIS-v2\products\trajectory_intervals\year=2022\partition=NNNN.parquet
 港口锚点只表达观测到的空间停留结构，港口组是独立目录映射。因此调整 `group_distance_km` 或删除 `Very Small` 港口时：
 
 - 不重读原始 CSV；
-- 不重建 canonical tracks、停留事件或点到锚点 geometry；
+- 不重建 canonical tracks、停留事件或点到 WPI 港口 geometry；
 - 自动重建 `port_groups → calls → intervals → validation`；
 - 保留原始港口成员、跨国家/地区标记、候选距离和歧义 margin 供效果验证。
 
@@ -188,7 +212,7 @@ products/validation/ambiguous_port_points.parquet
 
 - `D:\ExtractAIS-v2-temp`：包含当前活动轨迹分区的去重/冲突中间文件和 DuckDB spill；运行未进行时可删除，成功的 `run-all` 会自动清空。
 - `*/ingest_runs`：全部 tracks 完成后自动删除，也可用 `cleanup-staging`；命令会先验证全部轨迹检查点。
-- `point_anchor_candidates`、`port_context`：属于可重建证据，但删除后 `status` 会识别输出缺失；后续阶段不能独立复用。
+- `point_port_candidates`、`point_group_candidates`、`port_context`：属于可重建证据，但删除后 `status` 会识别输出缺失；后续阶段不能独立复用。
 - `products/validation`：可重建报告。
 - canonical tracks、port calls 和最终 intervals 是主要保留结果，不应当作临时文件删除。
 
