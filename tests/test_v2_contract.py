@@ -287,6 +287,15 @@ def test_end_to_end_v2_outputs_country_and_auditable_groups(tmp_path: Path) -> N
     assert any("Area Alpha" in row for pair in values for row in pair if row)
     assert any("Area Beta" in row for pair in values for row in pair if row)
 
+    calls_glob = str(config.storage.products_root / "port_calls" / "*.parquet")
+    assert duckdb.sql(
+        f"""
+        SELECT count(*)
+        FROM read_parquet('{calls_glob}')
+        WHERE has_port_ambiguity IS NULL
+        """
+    ).fetchone()[0] == 0
+
     groups = duckdb.read_parquet(
         str(config.storage.products_root / "ports" / "port_groups.parquet")
     )

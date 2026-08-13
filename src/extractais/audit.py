@@ -30,7 +30,7 @@ from extractais.storage import (
 from extractais.validate import validation_partial_paths
 
 
-AUDIT_CONTRACT_VERSION = 1
+AUDIT_CONTRACT_VERSION = 2
 
 
 def _temporary(path: Path) -> Path:
@@ -44,6 +44,7 @@ def _track_partial_paths(config: AppConfig, partition: int) -> tuple[Path, ...]:
         root / "summary" / name,
         root / "extent_bins" / name,
         root / "examples" / name,
+        root / "invalid_timestamp_years" / name,
     )
 
 
@@ -69,6 +70,7 @@ def _audit_outputs(config: AppConfig) -> dict[str, Path]:
         "time_conflict_summary": root / "time_conflict_summary.csv",
         "time_conflict_extent_bins": root / "time_conflict_extent_bins.csv",
         "time_conflict_examples": root / "time_conflict_examples.parquet",
+        "invalid_timestamp_years": root / "invalid_timestamp_years.csv",
         "unknown_gap_duration": root / "unknown_gap_duration.csv",
         "unknown_gap_coverage": root / "unknown_gap_coverage.csv",
         "state_transitions": root / "state_transitions.csv",
@@ -118,6 +120,9 @@ def _track_audit_worker(
     )
 
     source = parquet_sources([track])
+    configured_years = ", ".join(
+        str(year) for year in sorted(config.input.year_directories)
+    )
     extent = haversine_km(
         "minimum_latitude",
         "extent_minimum_longitude",
@@ -128,7 +133,7 @@ def _track_audit_worker(
     try:
         heartbeat(
             heartbeat_path,
-            "1/3 grouping same-second positions",
+            "1/4 grouping same-second positions",
             space_path=str(config.storage.temp_root.resolve()),
         )
         connection.execute(
@@ -153,6 +158,7 @@ def _track_audit_worker(
                              ELSE longitude END) AS wrapped_maximum_longitude
                 FROM {source}
                 WHERE is_time_conflict
+                  AND year(timestamp_utc)::INTEGER IN ({configured_years})
                 GROUP BY year, mmsi, timestamp_utc
             ),
             normalized AS (
@@ -192,7 +198,7 @@ def _track_audit_worker(
 
         heartbeat(
             heartbeat_path,
-            "2/3 writing point-level summary",
+            "2/4 writing point-level summary",
             progress_path=str(temporary[0].resolve()),
             space_path=str(config.storage.products_root.resolve()),
         )
@@ -205,9 +211,13 @@ def _track_audit_worker(
                             year(timestamp_utc)::INTEGER AS year,
                             count(*) AS point_count,
                             count(DISTINCT mmsi) AS vessel_count,
+                            count(*) FILTER (WHERE NOT is_kinematic_outlier)
+                                AS interval_eligible_point_count,
                             count(*) FILTER (WHERE is_time_conflict)
                                 AS flagged_time_conflict_point_count
                         FROM {source}
+                        WHERE year(timestamp_utc)::INTEGER
+                            IN ({configured_years})
                         GROUP BY year
                     ),
                     conflict_summary AS (
@@ -223,6 +233,7 @@ def _track_audit_worker(
                         {partition}::INTEGER AS track_partition_id,
                         p.point_count,
                         p.vessel_count,
+                        p.interval_eligible_point_count,
                         p.flagged_time_conflict_point_count,
                         coalesce(c.time_conflict_timestamp_count, 0)
                             AS time_conflict_timestamp_count,
@@ -240,7 +251,7 @@ def _track_audit_worker(
 
         heartbeat(
             heartbeat_path,
-            "3/3 writing conflict extent evidence",
+            "3/4 writing conflict extent evidence",
             progress_path=str(temporary[1].resolve()),
             space_path=str(config.storage.products_root.resolve()),
         )
@@ -290,6 +301,34 @@ def _track_audit_worker(
                 )
             ).fetchone()[0]
         )
+        heartbeat(
+            heartbeat_path,
+            "4/4 reporting invalid timestamp years",
+            progress_path=str(temporary[3].resolve()),
+            space_path=str(config.storage.products_root.resolve()),
+        )
+        invalid_year_count = int(
+            connection.execute(
+                parquet_copy_sql(
+                    f"""
+                    SELECT
+                        year(timestamp_utc)::INTEGER AS observed_year,
+                        {partition}::INTEGER AS track_partition_id,
+                        count(*) AS point_count,
+                        count(DISTINCT mmsi) AS vessel_count,
+                        min(timestamp_utc) AS minimum_timestamp_utc,
+                        max(timestamp_utc) AS maximum_timestamp_utc
+                    FROM {source}
+                    WHERE year(timestamp_utc)::INTEGER
+                        NOT IN ({configured_years})
+                    GROUP BY observed_year
+                    """,
+                    temporary[3],
+                    config,
+                    order_by="observed_year",
+                )
+            ).fetchone()[0]
+        )
     finally:
         connection.close()
         shutil.rmtree(worker_temp, ignore_errors=True)
@@ -298,7 +337,9 @@ def _track_audit_worker(
         atomic_replace(source_path, output)
     heartbeat(heartbeat_path, "committed")
     return {
-        "row_count": summary_count + bin_count + example_count,
+        "row_count": (
+            summary_count + bin_count + example_count + invalid_year_count
+        ),
         "output_bytes": sum(path.stat().st_size for path in outputs),
     }
 
@@ -338,6 +379,9 @@ def _behavior_audit_worker(
     call_source = parquet_sources([calls])
     ambiguous_source = parquet_sources([ambiguous])
     current_margin = config.ports.ambiguity_margin_km
+    configured_years = ", ".join(
+        str(year) for year in sorted(config.input.year_directories)
+    )
     connection = open_database(config, worker_temp, worker=True)
     try:
         heartbeat(
@@ -349,10 +393,18 @@ def _behavior_audit_worker(
             f"CREATE TEMP VIEW audit_intervals AS SELECT * FROM {interval_source}"
         )
         connection.execute(
-            f"CREATE TEMP VIEW audit_calls AS SELECT * FROM {call_source}"
+            f"""
+            CREATE TEMP VIEW audit_calls AS
+            SELECT * FROM {call_source}
+            WHERE year(entry_time_utc)::INTEGER IN ({configured_years})
+            """
         )
         connection.execute(
-            f"CREATE TEMP VIEW ambiguous_points AS SELECT * FROM {ambiguous_source}"
+            f"""
+            CREATE TEMP VIEW ambiguous_points AS
+            SELECT * FROM {ambiguous_source}
+            WHERE year(timestamp_utc)::INTEGER IN ({configured_years})
+            """
         )
 
         heartbeat(
@@ -457,6 +509,8 @@ def _behavior_audit_worker(
                 c.minimum_port_distance_km,
                 c.minimum_ambiguity_margin_km,
                 c.has_port_ambiguity,
+                c.has_port_ambiguity IS NULL
+                    AS source_ambiguity_flag_is_null,
                 coalesce(a.ambiguous_point_count, 0) AS ambiguous_point_count,
                 coalesce(a.ambiguous_point_count, 0)::DOUBLE
                     / nullif(c.point_count, 0) AS ambiguous_point_fraction,
@@ -483,8 +537,9 @@ def _behavior_audit_worker(
                 coalesce(l.has_arriving_interval, false) AS has_arriving_interval,
                 coalesce(l.has_in_port_interval, false) AS has_in_port_interval,
                 coalesce(l.has_departing_interval, false) AS has_departing_interval,
-                c.has_port_ambiguity IS DISTINCT FROM
-                    (coalesce(a.ambiguous_point_count, 0) > 0)
+                c.has_port_ambiguity IS NOT NULL
+                    AND c.has_port_ambiguity IS DISTINCT FROM
+                        (coalesce(a.ambiguous_point_count, 0) > 0)
                     AS ambiguity_flag_mismatch
             FROM audit_calls c
             LEFT JOIN ambiguous_by_call a USING (port_call_id)
@@ -687,6 +742,9 @@ def _behavior_audit_worker(
                                 AS ambiguous_points_le_0_25_km,
                             sum(ambiguous_points_le_0_50_km)
                                 AS ambiguous_points_le_0_50_km,
+                            count(*) FILTER (
+                                WHERE source_ambiguity_flag_is_null
+                            ) AS source_ambiguity_flag_null_count,
                             count(*) FILTER (WHERE ambiguity_flag_mismatch)
                                 AS ambiguity_flag_mismatch_count
                         FROM call_quality
@@ -962,6 +1020,7 @@ def _merge_audit_worker(
     track_summary_paths = [paths[0] for paths in track_partials]
     track_bin_paths = [paths[1] for paths in track_partials]
     track_example_paths = [paths[2] for paths in track_partials]
+    track_invalid_year_paths = [paths[3] for paths in track_partials]
     behavior_columns = list(zip(*behavior_partials))
     (
         gap_paths,
@@ -979,7 +1038,7 @@ def _merge_audit_worker(
     connection = open_database(config, worker_temp, worker=False)
     row_count = 0
     try:
-        heartbeat(heartbeat_path, "1/14 merging time-conflict summary")
+        heartbeat(heartbeat_path, "1/15 merging time-conflict summary")
         _copy_csv(
             connection,
             f"""
@@ -1001,7 +1060,7 @@ def _merge_audit_worker(
             temporary["time_conflict_summary"],
         )
 
-        heartbeat(heartbeat_path, "2/14 merging spatial conflict bins")
+        heartbeat(heartbeat_path, "2/15 merging spatial conflict bins")
         _copy_csv(
             connection,
             f"""
@@ -1045,7 +1104,24 @@ def _merge_audit_worker(
             ).fetchone()[0]
         )
 
-        heartbeat(heartbeat_path, "3/14 merging unknown-gap duration")
+        heartbeat(heartbeat_path, "3/15 merging invalid timestamp years")
+        _copy_csv(
+            connection,
+            f"""
+            SELECT
+                observed_year,
+                sum(point_count) AS point_count,
+                sum(vessel_count) AS vessel_count,
+                min(minimum_timestamp_utc) AS minimum_timestamp_utc,
+                max(maximum_timestamp_utc) AS maximum_timestamp_utc
+            FROM {parquet_sources(track_invalid_year_paths)}
+            GROUP BY observed_year
+            ORDER BY observed_year
+            """,
+            temporary["invalid_timestamp_years"],
+        )
+
+        heartbeat(heartbeat_path, "4/15 merging unknown-gap duration")
         _copy_csv(
             connection,
             f"""
@@ -1080,7 +1156,7 @@ def _merge_audit_worker(
             temporary["unknown_gap_coverage"],
         )
 
-        heartbeat(heartbeat_path, "4/14 merging state transitions")
+        heartbeat(heartbeat_path, "5/15 merging state transitions")
         _copy_csv(
             connection,
             f"""
@@ -1095,7 +1171,7 @@ def _merge_audit_worker(
             temporary["state_transitions"],
         )
 
-        heartbeat(heartbeat_path, "5/14 measuring interval flag propagation")
+        heartbeat(heartbeat_path, "6/15 measuring interval flag propagation")
         _copy_csv(
             connection,
             f"""
@@ -1111,7 +1187,7 @@ def _merge_audit_worker(
             temporary["interval_flag_propagation"],
         )
 
-        heartbeat(heartbeat_path, "6/14 checking ambiguity assignment coverage")
+        heartbeat(heartbeat_path, "7/15 checking ambiguity assignment coverage")
         _copy_csv(
             connection,
             f"""
@@ -1131,7 +1207,7 @@ def _merge_audit_worker(
         )
 
         call_summaries = parquet_sources(call_summary_paths)
-        heartbeat(heartbeat_path, "7/14 merging call ambiguity distribution")
+        heartbeat(heartbeat_path, "8/15 merging call ambiguity distribution")
         _copy_csv(
             connection,
             f"""
@@ -1144,6 +1220,8 @@ def _merge_audit_worker(
                     AS recomputed_ambiguous_call_count,
                 sum(call_count) FILTER (WHERE has_port_ambiguity)
                     AS source_ambiguous_call_count,
+                sum(source_ambiguity_flag_null_count)
+                    AS source_ambiguity_flag_null_count,
                 sum(ambiguity_flag_mismatch_count)
                     AS ambiguity_flag_mismatch_count
             FROM {call_summaries}
@@ -1153,7 +1231,7 @@ def _merge_audit_worker(
             temporary["call_ambiguity_distribution"],
         )
 
-        heartbeat(heartbeat_path, "8/14 building per-port call quality")
+        heartbeat(heartbeat_path, "9/15 building per-port call quality")
         _copy_csv(
             connection,
             f"""
@@ -1184,6 +1262,8 @@ def _merge_audit_worker(
                       AND has_in_port_interval
                       AND has_departing_interval
                 ) AS complete_lifecycle_call_count,
+                sum(source_ambiguity_flag_null_count)
+                    AS source_ambiguity_flag_null_count,
                 sum(ambiguity_flag_mismatch_count)
                     AS ambiguity_flag_mismatch_count
             FROM {call_summaries}
@@ -1193,7 +1273,7 @@ def _merge_audit_worker(
             temporary["port_call_quality"],
         )
 
-        heartbeat(heartbeat_path, "9/14 merging call lifecycle patterns")
+        heartbeat(heartbeat_path, "10/15 merging call lifecycle patterns")
         _copy_csv(
             connection,
             f"""
@@ -1214,7 +1294,7 @@ def _merge_audit_worker(
             temporary["call_lifecycle"],
         )
 
-        heartbeat(heartbeat_path, "10/14 ranking competing port groups")
+        heartbeat(heartbeat_path, "11/15 ranking competing port groups")
         group_source = parquet_sources([groups])
         group_distance = haversine_km(
             "origin.latitude",
@@ -1272,7 +1352,7 @@ def _merge_audit_worker(
             temporary["competing_port_pairs"],
         )
 
-        heartbeat(heartbeat_path, "11/14 selecting deterministic review calls")
+        heartbeat(heartbeat_path, "12/15 selecting deterministic review calls")
         row_count += int(
             connection.execute(
                 parquet_copy_sql(
@@ -1313,7 +1393,7 @@ def _merge_audit_worker(
             ).fetchone()[0]
         )
 
-        heartbeat(heartbeat_path, "12/14 collecting review-point evidence")
+        heartbeat(heartbeat_path, "13/15 collecting review-point evidence")
         row_count += int(
             connection.execute(
                 parquet_copy_sql(
@@ -1345,11 +1425,12 @@ def _merge_audit_worker(
             ).fetchone()[0]
         )
 
-        heartbeat(heartbeat_path, "13/14 calculating headline metrics")
+        heartbeat(heartbeat_path, "14/15 calculating headline metrics")
         track_metrics = connection.execute(
             f"""
             SELECT
                 sum(point_count),
+                sum(interval_eligible_point_count),
                 sum(flagged_time_conflict_point_count),
                 sum(time_conflict_timestamp_count)
             FROM {parquet_sources(track_summary_paths)}
@@ -1361,6 +1442,18 @@ def _merge_audit_worker(
             FROM {parquet_sources(coverage_paths)}
             """
         ).fetchone()
+        interval_point_count = connection.execute(
+            f"""
+            SELECT sum(ais_point_count)
+            FROM {parquet_sources(interval_flag_paths)}
+            """
+        ).fetchone()[0]
+        invalid_year_point_count = connection.execute(
+            f"""
+            SELECT sum(point_count)
+            FROM {parquet_sources(track_invalid_year_paths)}
+            """
+        ).fetchone()[0]
         call_metrics = connection.execute(
             f"""
             SELECT
@@ -1368,6 +1461,7 @@ def _merge_audit_worker(
                 sum(recomputed_ambiguous_call_count),
                 sum(call_point_count),
                 sum(ambiguous_point_count),
+                sum(source_ambiguity_flag_null_count),
                 sum(ambiguity_flag_mismatch_count)
             FROM {call_summaries}
             """
@@ -1403,15 +1497,24 @@ def _merge_audit_worker(
             },
             "headline_metrics": {
                 "ais_point_count": int(track_metrics[0] or 0),
-                "flagged_time_conflict_point_count": int(track_metrics[1] or 0),
-                "time_conflict_timestamp_count": int(track_metrics[2] or 0),
+                "interval_eligible_ais_point_count": int(track_metrics[1] or 0),
+                "interval_ais_point_count": int(interval_point_count or 0),
+                "interval_point_count_difference": int(
+                    (interval_point_count or 0) - (track_metrics[1] or 0)
+                ),
+                "invalid_timestamp_year_point_count": int(
+                    invalid_year_point_count or 0
+                ),
+                "flagged_time_conflict_point_count": int(track_metrics[2] or 0),
+                "time_conflict_timestamp_count": int(track_metrics[3] or 0),
                 "vessel_active_span_seconds": int(gap_metrics[0] or 0),
                 "unknown_gap_seconds": int(gap_metrics[1] or 0),
                 "port_call_count": int(call_metrics[0] or 0),
                 "recomputed_ambiguous_call_count": int(call_metrics[1] or 0),
                 "call_point_count": int(call_metrics[2] or 0),
                 "ambiguous_call_point_count": int(call_metrics[3] or 0),
-                "ambiguity_flag_mismatch_count": int(call_metrics[4] or 0),
+                "source_ambiguity_flag_null_count": int(call_metrics[4] or 0),
+                "ambiguity_flag_mismatch_count": int(call_metrics[5] or 0),
                 "all_ambiguous_point_count": int(assignment_metrics[0] or 0),
                 "assigned_ambiguous_point_count": int(assignment_metrics[1] or 0),
             },
@@ -1430,7 +1533,7 @@ def _merge_audit_worker(
             ],
         }
         write_json_atomic(temporary["summary"], summary)
-        heartbeat(heartbeat_path, "14/14 committing audit reports")
+        heartbeat(heartbeat_path, "15/15 committing audit reports")
     finally:
         connection.close()
         shutil.rmtree(worker_temp, ignore_errors=True)

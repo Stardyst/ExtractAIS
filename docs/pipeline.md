@@ -1,4 +1,4 @@
-# ExtractAIS v2.2 processing contract
+# ExtractAIS v2.3 processing contract
 
 ## Invariants
 
@@ -49,7 +49,7 @@ WPI ports within `group_distance_km` form connected components. Every member sta
 
 ### Geometry and calls
 
-A coarse tile join and Haversine distance first produce compact point-anchor edges in 64 temporary hash shards. Each shard is reduced to the nearest anchor for every `(point, WPI port)` pair, then the raw edge shard is deleted. This reduction is exact for every future port grouping because the minimum over a group equals the minimum of its member-port minima. Calls map the compact WPI-port candidates through the current groups, retain the first and second group distances, and require an approach episode with entry evidence and an independently detected stop overlap.
+A coarse tile join and Haversine distance first produce compact point-anchor edges in 64 temporary hash shards. Each shard is reduced to the nearest anchor for every `(point, WPI port)` pair, then the raw edge shard is deleted. This reduction is exact for every future port grouping because the minimum over a group equals the minimum of its member-port minima. Calls map the compact WPI-port candidates through the current groups, retain the first and second group distances, and require an approach episode with entry evidence and an independently detected stop overlap. Calls outside the configured years are excluded. A missing second candidate is represented as `has_port_ambiguity=false`, never null.
 
 ### Intervals
 
@@ -60,7 +60,7 @@ Each point receives its previous and next confirmed call. Classification precede
 3. Near the next confirmed group: `ARRIVING`.
 4. Otherwise: `OCEAN`.
 
-Observation gaps above `unknown_gap_hours` are explicit `UNKNOWN_GAP` rows. Consecutive points with equal state/from/to context are compressed into one interval. Cross-year intervals are clipped to annual outputs.
+Observation gaps above `unknown_gap_hours` are explicit `UNKNOWN_GAP` rows. Consecutive points with equal state/from/to context are compressed into one interval. Cross-year state continuity is preserved, but point counts, speed statistics, observation-gap statistics and quality flags are re-aggregated from the points inside each configured year before annual outputs are written. Positive-duration gaps are clipped at year boundaries; invalid timestamp years do not enter annual products.
 
 ## Dependency invalidation
 
@@ -110,5 +110,7 @@ The audit separates four grains that the fast validation reports combine:
 4. Compressed state intervals and vessel-year elapsed-time coverage.
 
 Same-second spatial extent is the Haversine diagonal of the coordinate bounding box. It is a separation proxy, not an exact pairwise diameter or mathematical bound. Call ambiguity is reported both as calls containing at least one ambiguous point and as ambiguous points divided by all call points. Unknown gaps are reported as elapsed seconds divided by each vessel-year active span, never as row-count share.
+
+The audit separately reports canonical points whose timestamp year is outside the configured input years. It also reconciles interval-eligible canonical points with the sum of annual interval `ais_point_count`; `interval_point_count_difference` must be zero. Null source ambiguity flags and genuine source/recomputed mismatches are different metrics.
 
 Review evidence is bounded. Each track partition contributes only the strongest call candidates; each selected call contributes at most ten closest-margin points and five points from each temporal boundary. The global sample retains at most 200 calls per review stratum. No port groups are automatically merged by the audit.

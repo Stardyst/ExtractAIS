@@ -1,4 +1,4 @@
-# ExtractAIS 2.2
+# ExtractAIS 2.3
 
 ExtractAIS 将按日 CSV 形式保存的超大规模 AIS 档案，转换为按 MMSI 和时间排序的年度船舶运行区间。v2 是不兼容重构：原始 CSV 每日只解析一次，动态信息和静态信息立即分离；船舶全量排序只执行一次；重任务按固定 MMSI 分区分布到独立物理盘。
 
@@ -13,7 +13,7 @@ python -m pip install -e .
 python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
 ```
 
-版本必须是 `ExtractAIS 2.2.0`、`DuckDB 1.5.4`。已有环境升级：
+版本必须是 `ExtractAIS 2.3.0`、`DuckDB 1.5.4`。已有环境升级：
 
 ```powershell
 git pull origin main
@@ -137,7 +137,7 @@ extractais --config configs/production.yaml run-all 2>&1 |
   Tee-Object -FilePath logs/run-all-v2-resume.log
 ```
 
-应输出 `2.2.0 1.5.4`。2.2.0 不改变 `tracks` 的任务签名和最终 Parquet 契约，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
+应输出 `2.3.0 1.5.4`。2.3.0 不改变 `tracks` 的任务签名和最终 Parquet 契约，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
 
 ### 从 2.0.2 的 geometry 候选爆炸恢复
 
@@ -162,6 +162,25 @@ Remove-Item -LiteralPath "I:\ExtractAIS-v2\evidence\point_anchor_candidates" -Re
 
 执行前必须逐一核对绝对路径。2.1.0 的新证据目录名为 `point_port_candidates`，不在删除范围内。
 
+### 从 2.2.0 修复年度区间和质量审计
+
+2.2.0 在跨年连续状态段上先汇总点数、航速和质量证据，再裁切到年度文件，导致同一段统计复制到两个年份。港口调用在没有第二候选港时还可能写出空的 `has_port_ambiguity`。2.3.0 改为在保留跨年状态连续性的同时，按年度内实际观测点重新计算全部统计字段，并将缺少第二候选港明确记为不歧义。
+
+升级后执行：
+
+```powershell
+git pull origin main
+conda activate extractais
+python -m pip install --upgrade -e .
+python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
+extractais --config configs/production.yaml run-all 2>&1 |
+  Tee-Object -FilePath logs/run-all-v2.3-rebuild.log
+extractais --config configs/production.yaml audit-quality 2>&1 |
+  Tee-Object -FilePath logs/audit-quality-v2.3.log
+```
+
+`run-all` 会复用 `ingest`、`tracks`、`ports` 和 `geometry`，从 `calls` 自动重建 `port_context`、港口调用、年度区间和 validation。`audit-quality` 的契约版本也已更新，会自动重建旧 partials；不需要删除 `state.sqlite` 或任何已完成的上游产品。两个命令都可中断后继续。
+
 ## 6. 最终区间字段
 
 最终目录：
@@ -181,13 +200,14 @@ H:\ExtractAIS-v2\products\trajectory_intervals\year=2022\partition=NNNN.parquet
 | `from_port_country_or_area` | 前一港口所在国家或地区 |
 | `to_port_call_id`, `to_port_group_id`, `to_port_group_name` | 下一确认港口调用/港口组 |
 | `to_port_country_or_area` | 下一港口所在国家或地区 |
-| `ais_point_count`, `valid_speed_point_count` | 区间 AIS 点数和有效航速点数 |
-| `min_speed_knots`, `mean_speed_knots`, `max_speed_knots` | 区间航速统计 |
+| `ais_point_count`, `valid_speed_point_count` | 该年度区间内的 AIS 点数和有效航速点数 |
+| `min_speed_knots`, `mean_speed_knots`, `max_speed_knots` | 仅由该年度区间内观测点计算的航速统计 |
 | `max_observation_gap_seconds` | 区间内最大观测间隔 |
 | `has_time_conflict`, `has_port_ambiguity` | 时间冲突和港口歧义证据 |
 | `quality_flag`, `track_partition_id` | 质量标签和可追溯物理分区 |
 
 不输出端点经纬度、持续时间和起终点直线距离。持续时间可由两个时间字段准确计算。
+跨年状态连续性保留，但点数、航速、最大观测间隔和质量标记按年度内实际观测重新计算，不会在两个年度间复制。配置年份以外的异常时间戳保留在 canonical tracks 中供追溯，不进入港口调用和年度区间。
 跨国家/地区港口组无法可靠细分时，国家/地区字段以 `; ` 连接全部成员值，同时在港口组目录中保留 `is_cross_border=true`。
 
 ## 7. 港口组更新边界
@@ -252,6 +272,7 @@ extractais --config configs/production.yaml audit-quality 2>&1 |
 | `time_conflict_summary.csv` | 真正的 AIS 点级同秒冲突比例 |
 | `time_conflict_extent_bins.csv` | 同秒坐标包围盒对角距离代理量分层，区分近重复和远距离矛盾 |
 | `time_conflict_examples.parquet` | 各距离层的高风险同秒样本 |
+| `invalid_timestamp_years.csv` | 配置年份之外的 canonical AIS 点数、船舶数和时间范围 |
 | `unknown_gap_duration.csv` | 按 6–12 小时、12–24 小时、1–3 天等统计中断时长 |
 | `unknown_gap_coverage.csv` | 船舶年度活跃时间窗中的中断时间占比 |
 | `state_transitions.csv` | 合并相邻同状态后得到的状态转移矩阵 |
@@ -264,6 +285,6 @@ extractais --config configs/production.yaml audit-quality 2>&1 |
 | `review_calls.parquet` | 高歧义比例、高歧义点数和低歧义对照调用的确定性样本 |
 | `review_ambiguous_points.parquet` | 样本调用的代表 AIS 点及两个候选港口组坐标和距离 |
 
-建议按以下顺序判断：先确认 `ambiguity_flag_mismatch_count` 接近零，验证调用歧义重算与原标签一致；再比较调用歧义率与调用内歧义点率；随后查看 `competing_port_pairs.csv` 的集中程度；最后在 QGIS/Python 中人工复核两个 `review_*.parquet`。`ambiguity_assignment.csv` 的未分配点通常是未形成确认调用的港口候选点，不要求达到 100%。这些报告只衡量内部一致性和证据集中度，没有人工标签时仍不能称为港口识别准确率。
+先检查 `summary.json`：`interval_point_count_difference` 必须为 0，`source_ambiguity_flag_null_count` 必须为 0，`ambiguity_flag_mismatch_count` 应接近 0。随后比较调用歧义率与调用内歧义点率，查看 `competing_port_pairs.csv` 的集中程度，最后在 QGIS/Python 中人工复核两个 `review_*.parquet`。`invalid_timestamp_years.csv` 应单独报告而不能混入 2021/2022；`ambiguity_assignment.csv` 的未分配点通常是未形成确认调用的港口候选点，不要求达到 100%。这些报告只衡量内部一致性和证据集中度，没有人工标签时仍不能称为港口识别准确率。
 
 完整算法和失效边界见 [docs/pipeline.md](docs/pipeline.md)。

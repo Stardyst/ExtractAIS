@@ -24,6 +24,9 @@ from extractais.storage import (
 )
 
 
+CALL_CONTRACT_VERSION = 2
+
+
 def group_candidate_path(config: AppConfig, partition: int) -> Path:
     return evidence_root_for_partition(config, partition) / "point_group_candidates" / f"partition={partition:04d}.parquet"
 
@@ -71,6 +74,9 @@ def _calls_worker(
     )
 
     connection = open_database(config, worker_temp, worker=True)
+    configured_years = ", ".join(
+        str(year) for year in sorted(config.input.year_directories)
+    )
     try:
         heartbeat(heartbeat_path, "mapping anchor evidence to port groups")
         connection.execute(
@@ -86,6 +92,7 @@ def _calls_worker(
                 JOIN {parquet_sources([catalog])} p
                   ON c.nearest_port_id = p.port_id
                 JOIN {parquet_sources([groups])} g USING (port_group_id)
+                WHERE year(c.timestamp_utc)::INTEGER IN ({configured_years})
             ),
             by_group AS (
                 SELECT
@@ -277,8 +284,11 @@ def _calls_worker(
                 md5(concat(mmsi::VARCHAR, '|', port_group_id, '|', entry_time_utc::VARCHAR))
                     AS port_call_id,
                 *,
-                minimum_ambiguity_margin_km < {config.ports.ambiguity_margin_km}
-                    AS has_port_ambiguity
+                coalesce(
+                    minimum_ambiguity_margin_km
+                        < {config.ports.ambiguity_margin_km},
+                    false
+                ) AS has_port_ambiguity
             FROM evidence
             WHERE entry_time_utc IS NOT NULL
               AND exit_time_utc IS NOT NULL
@@ -320,6 +330,7 @@ def build_calls(config: AppConfig, store: CheckpointStore) -> None:
     ]
     global_signature = signature(
         [
+            CALL_CONTRACT_VERSION,
             config.raw["ports"],
             [(path.stat().st_size, path.stat().st_mtime_ns) for path in dependencies],
         ]

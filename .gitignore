@@ -29,6 +29,7 @@ manifests/
 rejects/
 logs/
 tmp/
+quality_audit/
 
 # Keep small test fixtures when explicitly added later
 !tests/fixtures/*.csv

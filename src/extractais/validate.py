@@ -25,6 +25,9 @@ from extractais.storage import (
 )
 
 
+VALIDATION_CONTRACT_VERSION = 2
+
+
 def validation_partial_paths(
     config: AppConfig, partition: int
 ) -> tuple[Path, Path, Path]:
@@ -100,7 +103,9 @@ def _validation_partial_worker(
                             AS country_or_area_name,
                         count(*) AS port_call_count,
                         count(DISTINCT mmsi) AS vessel_count,
-                        count(*) FILTER (WHERE has_port_ambiguity)
+                        count(*) FILTER (
+                            WHERE coalesce(has_port_ambiguity, false)
+                        )
                             AS ambiguous_call_count,
                         min(minimum_ambiguity_margin_km)
                             AS minimum_ambiguity_margin_km
@@ -263,7 +268,13 @@ def _merge_validation_worker(
 
 def build_validation(config: AppConfig, store: CheckpointStore) -> None:
     tasks: list[StageTask] = []
-    stage_hash = signature([config.raw["ports"], config.raw["intervals"]])
+    stage_hash = signature(
+        [
+            VALIDATION_CONTRACT_VERSION,
+            config.raw["ports"],
+            config.raw["intervals"],
+        ]
+    )
     for partition in range(config.layout.track_partitions):
         dependencies = [
             port_call_path(config, partition),

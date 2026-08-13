@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import duckdb
@@ -45,19 +46,22 @@ def test_track_audit_separates_flagged_points_from_spatial_conflict(
         """
         SELECT * FROM (VALUES
             (123456789::BIGINT, 1::BIGINT, TIMESTAMP '2021-01-01 00:00:00',
-             0.0::DOUBLE, 0.0::DOUBLE, true),
+             0.0::DOUBLE, 0.0::DOUBLE, true, false),
             (123456789::BIGINT, 2::BIGINT, TIMESTAMP '2021-01-01 00:00:00',
-             0.0::DOUBLE, 0.0005::DOUBLE, true),
+             0.0::DOUBLE, 0.0005::DOUBLE, true, false),
             (123456789::BIGINT, 3::BIGINT, TIMESTAMP '2021-01-01 01:00:00',
-             0.0::DOUBLE, 1.0::DOUBLE, false)
+             0.0::DOUBLE, 1.0::DOUBLE, false, false),
+            (987654321::BIGINT, 1::BIGINT, TIMESTAMP '0021-01-01 00:00:00',
+             0.0::DOUBLE, 0.0::DOUBLE, false, false)
         ) AS t(mmsi, point_seq, timestamp_utc, latitude, longitude,
-               is_time_conflict)
+               is_time_conflict, is_kinematic_outlier)
         """,
     )
     outputs = (
         tmp_path / "track-summary.parquet",
         tmp_path / "conflict-bins.parquet",
         tmp_path / "conflict-examples.parquet",
+        tmp_path / "invalid-timestamp-years.parquet",
     )
 
     _track_audit_worker(
@@ -73,6 +77,11 @@ def test_track_audit_separates_flagged_points_from_spatial_conflict(
     assert values["point_count"] == 3
     assert values["flagged_time_conflict_point_count"] == 2
     assert values["time_conflict_timestamp_count"] == 1
+
+    invalid = duckdb.read_parquet(str(outputs[3]))
+    invalid_values = dict(zip(invalid.columns, invalid.fetchone()))
+    assert invalid_values["observed_year"] == 21
+    assert invalid_values["point_count"] == 1
 
     conflict_bin = duckdb.read_parquet(str(outputs[1])).fetchone()
     assert conflict_bin[0] == "LE_100_M"
@@ -116,7 +125,13 @@ def test_behavior_audit_measures_call_ambiguity_and_gap_duration(
              TIMESTAMP '2021-01-01 01:30:00',
              TIMESTAMP '2021-01-01 00:30:00',
              TIMESTAMP '2021-01-01 01:30:00', 10::BIGINT, 0.1::DOUBLE,
-             1::BIGINT, 0::BIGINT, 1::BIGINT, 0.1::DOUBLE, true)
+             1::BIGINT, 0::BIGINT, 1::BIGINT, 0.1::DOUBLE, true),
+            ('C2', 987654321::BIGINT, 0::INTEGER, 2::BIGINT, 'PG-3', 'Port C',
+             'Area Beta', TIMESTAMP '2021-02-01 00:00:00',
+             TIMESTAMP '2021-02-01 01:30:00',
+             TIMESTAMP '2021-02-01 00:30:00',
+             TIMESTAMP '2021-02-01 01:30:00', 10::BIGINT, 0.1::DOUBLE,
+             1::BIGINT, 0::BIGINT, 1::BIGINT, NULL::DOUBLE, NULL::BOOLEAN)
         ) AS t(port_call_id, mmsi, track_partition_id, episode_number,
                port_group_id, port_group_name, port_country_or_area,
                approach_start_time_utc, approach_end_time_utc, entry_time_utc,
@@ -176,7 +191,7 @@ def test_behavior_audit_measures_call_ambiguity_and_gap_duration(
     assert coverage_values["total_gap_seconds"] == 8 * 3600
 
     review = duckdb.read_parquet(str(outputs[4]))
-    call = review.fetchone()
+    call = review.filter("port_call_id = 'C1'").fetchone()
     call_values = dict(zip(review.columns, call))
     assert call_values["ambiguous_point_count"] == 1
     assert call_values["ambiguous_point_fraction"] == pytest.approx(0.1)
@@ -196,6 +211,14 @@ def test_behavior_audit_measures_call_ambiguity_and_gap_duration(
     assert transitions[("IN_PORT", "DEPARTING")] == 1
     assert transitions[("DEPARTING", "OCEAN")] == 1
     assert transitions[("OCEAN", "UNKNOWN_GAP")] == 1
+
+    call_summary = duckdb.read_parquet(str(outputs[3]))
+    null_count, mismatch_count = call_summary.aggregate(
+        "sum(source_ambiguity_flag_null_count), "
+        "sum(ambiguity_flag_mismatch_count)"
+    ).fetchone()
+    assert null_count == 1
+    assert mismatch_count == 0
 
 
 def test_quality_audit_is_resumable_and_does_not_modify_pipeline_products(
@@ -228,6 +251,7 @@ def test_quality_audit_is_resumable_and_does_not_modify_pipeline_products(
     expected = {
         "summary.json",
         "time_conflict_summary.csv",
+        "invalid_timestamp_years.csv",
         "unknown_gap_duration.csv",
         "port_call_quality.csv",
         "competing_port_pairs.csv",
@@ -246,6 +270,11 @@ def test_quality_audit_is_resumable_and_does_not_modify_pipeline_products(
 
     assert {path: path.stat().st_mtime_ns for path in source_paths} == source_mtimes
     assert {path: path.stat().st_mtime_ns for path in audit_mtimes} == audit_mtimes
+
+    summary = json.loads((audit_root / "summary.json").read_text(encoding="utf-8"))
+    assert summary["audit_contract_version"] == 2
+    assert summary["headline_metrics"]["interval_point_count_difference"] == 0
+    assert summary["headline_metrics"]["source_ambiguity_flag_null_count"] == 0
 
 
 def test_audit_cli_does_not_inventory_raw_csv(

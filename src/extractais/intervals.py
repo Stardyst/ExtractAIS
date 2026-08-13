@@ -23,6 +23,9 @@ from extractais.storage import (
 )
 
 
+INTERVAL_CONTRACT_VERSION = 2
+
+
 def interval_path(config: AppConfig, year: int, partition: int) -> Path:
     return (
         config.storage.products_root
@@ -45,6 +48,9 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
     context = parquet_sources([port_context_path(config, partition)])
     calls = parquet_sources([port_call_path(config, partition)])
     gap_threshold = int(config.intervals.unknown_gap_hours * 3600)
+    configured_years = ", ".join(
+        str(year) for year in sorted(config.input.year_directories)
+    )
     return f"""
         WITH valid_tracks AS (
             SELECT
@@ -54,6 +60,7 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
                 ) AS observed_previous_time_utc
             FROM {tracks}
             WHERE NOT is_kinematic_outlier
+              AND year(timestamp_utc)::INTEGER IN ({configured_years})
         ),
         track_gaps AS (
             SELECT
@@ -153,9 +160,13 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
                 ) AS segment_number
             FROM marked
         ),
-        observed_segments AS (
+        year_windows(year, year_start, year_end) AS (
+            VALUES {_year_windows(config)}
+        ),
+        observed_segment_bounds AS (
             SELECT
                 mmsi,
+                segment_number,
                 min(timestamp_utc) AS start_time_utc,
                 max(timestamp_utc) AS end_time_utc,
                 state,
@@ -166,7 +177,20 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
                 to_port_call_id,
                 to_port_group_id,
                 to_port_group_name,
-                to_port_country_or_area,
+                to_port_country_or_area
+            FROM grouped
+            GROUP BY
+                mmsi, segment_number, state,
+                from_port_call_id, from_port_group_id,
+                from_port_group_name, from_port_country_or_area,
+                to_port_call_id, to_port_group_id,
+                to_port_group_name, to_port_country_or_area
+        ),
+        observed_segment_year_stats AS (
+            SELECT
+                y.year,
+                g.mmsi,
+                g.segment_number,
                 count(*) AS ais_point_count,
                 count(speed) AS valid_speed_point_count,
                 min(speed) AS min_speed_knots,
@@ -178,13 +202,35 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
                 bool_or(is_time_conflict) AS has_time_conflict,
                 bool_or(is_port_ambiguous) AS has_port_ambiguity,
                 false AS is_unknown_gap
-            FROM grouped
-            GROUP BY
-                mmsi, segment_number, state,
-                from_port_call_id, from_port_group_id,
-                from_port_group_name, from_port_country_or_area,
-                to_port_call_id, to_port_group_id,
-                to_port_group_name, to_port_country_or_area
+            FROM grouped g
+            JOIN year_windows y
+              ON g.timestamp_utc >= y.year_start
+             AND g.timestamp_utc < y.year_end
+            GROUP BY y.year, g.mmsi, g.segment_number
+        ),
+        observed_segments AS (
+            SELECT
+                stats.year,
+                bounds.* EXCLUDE (
+                    segment_number, start_time_utc, end_time_utc
+                ),
+                greatest(bounds.start_time_utc, y.year_start)
+                    AS start_time_utc,
+                least(bounds.end_time_utc, y.year_end)
+                    AS end_time_utc,
+                stats.ais_point_count,
+                stats.valid_speed_point_count,
+                stats.min_speed_knots,
+                stats.mean_speed_knots,
+                stats.max_speed_knots,
+                stats.max_observation_gap_seconds,
+                stats.has_time_conflict,
+                stats.has_port_ambiguity,
+                stats.is_unknown_gap
+            FROM observed_segment_year_stats stats
+            JOIN observed_segment_bounds bounds
+              USING (mmsi, segment_number)
+            JOIN year_windows y USING (year)
         ),
         gap_context AS (
             SELECT
@@ -197,7 +243,7 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
             FROM classified
             WINDOW vessel_order AS (PARTITION BY mmsi ORDER BY point_seq)
         ),
-        unknown_gaps AS (
+        unknown_gaps_raw AS (
             SELECT
                 mmsi,
                 observed_previous_time_utc AS start_time_utc,
@@ -227,23 +273,23 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
             FROM gap_context
             WHERE observed_gap_seconds > {gap_threshold}
         ),
-        all_segments AS (
-            SELECT * FROM observed_segments
-            UNION ALL BY NAME
-            SELECT * FROM unknown_gaps
-        ),
-        year_windows(year, year_start, year_end) AS (
-            VALUES {_year_windows(config)}
-        ),
-        clipped AS (
+        unknown_gaps AS (
             SELECT
                 y.year,
                 s.* EXCLUDE (start_time_utc, end_time_utc),
                 greatest(s.start_time_utc, y.year_start) AS start_time_utc,
                 least(s.end_time_utc, y.year_end) AS end_time_utc
-            FROM all_segments s
+            FROM unknown_gaps_raw s
             JOIN year_windows y
-              ON s.end_time_utc >= y.year_start AND s.start_time_utc < y.year_end
+              ON s.end_time_utc > y.year_start
+             AND s.start_time_utc < y.year_end
+            WHERE least(s.end_time_utc, y.year_end)
+                > greatest(s.start_time_utc, y.year_start)
+        ),
+        all_segments AS (
+            SELECT * FROM observed_segments
+            UNION ALL BY NAME
+            SELECT * FROM unknown_gaps
         ),
         quality AS (
             SELECT
@@ -255,7 +301,7 @@ def _interval_sql(config: AppConfig, partition: int) -> str:
                     WHEN has_time_conflict THEN 'TIME_CONFLICT'
                     ELSE 'OBSERVED'
                 END AS quality_flag
-            FROM clipped
+            FROM all_segments
         )
         SELECT
             year,
@@ -359,7 +405,13 @@ def _interval_worker(
 
 
 def build_intervals(config: AppConfig, store: CheckpointStore) -> None:
-    interval_hash = signature([config.raw["ports"], config.raw["intervals"]])
+    interval_hash = signature(
+        [
+            INTERVAL_CONTRACT_VERSION,
+            config.raw["ports"],
+            config.raw["intervals"],
+        ]
+    )
     tasks: list[StageTask] = []
     for partition in range(config.layout.track_partitions):
         dependencies = [
