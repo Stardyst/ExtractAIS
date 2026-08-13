@@ -25,7 +25,9 @@ from extractais.storage import (
 )
 
 
-def _partial_paths(config: AppConfig, partition: int) -> tuple[Path, Path, Path]:
+def validation_partial_paths(
+    config: AppConfig, partition: int
+) -> tuple[Path, Path, Path]:
     root = config.storage.products_root / "validation" / "partials"
     return (
         root / "states" / f"partition={partition:04d}.parquet",
@@ -271,7 +273,7 @@ def build_validation(config: AppConfig, store: CheckpointStore) -> None:
                 for year in sorted(config.input.year_directories)
             ],
         ]
-        outputs = _partial_paths(config, partition)
+        outputs = validation_partial_paths(config, partition)
         task_signature = signature(
             [stage_hash, [(path.stat().st_size, path.stat().st_mtime_ns) for path in dependencies]]
         )
@@ -299,7 +301,10 @@ def build_validation(config: AppConfig, store: CheckpointStore) -> None:
     )
 
     state_paths, port_paths, ambiguous_paths = zip(
-        *[_partial_paths(config, partition) for partition in range(config.layout.track_partitions)]
+        *[
+            validation_partial_paths(config, partition)
+            for partition in range(config.layout.track_partitions)
+        ]
     )
     validation_root = config.storage.products_root / "validation"
     outputs = (

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -116,6 +117,25 @@ def heartbeat_phase_text(state: dict[str, Any]) -> str:
     return " ".join([phase, *details])
 
 
+def heartbeat_progress_fraction(state: dict[str, Any]) -> float:
+    explicit = state.get("progress_fraction")
+    if explicit is not None:
+        try:
+            return max(0.0, min(1.0, float(explicit)))
+        except (TypeError, ValueError):
+            return 0.0
+    phase = str(state.get("phase", ""))
+    if phase == "committed":
+        return 1.0
+    match = re.match(r"^(\d+)/(\d+)\b", phase)
+    if not match:
+        return 0.0
+    index, total = (int(value) for value in match.groups())
+    if total <= 0:
+        return 0.0
+    return max(0.0, min(1.0, (index - 1) / total))
+
+
 @dataclass(frozen=True)
 class StageTask:
     key: str
@@ -158,16 +178,23 @@ def run_stage_tasks(
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {postfix}]",
     )
     by_key = {task.key: task for task in pending}
+    active_fractions: dict[str, float] = {}
 
     def before_start(call, _active) -> None:
         task = by_key[call.key]
         unlink_with_retry(task.heartbeat_path)
         progress.start(task.key, task.source_bytes)
+        active_fractions[task.key] = 0.0
 
     def poll(active) -> None:
         for key in active:
             state = read_json(by_key[key].heartbeat_path, {})
             progress.phase(key, heartbeat_phase_text(state))
+            active_fractions[key] = max(
+                active_fractions.get(key, 0.0),
+                heartbeat_progress_fraction(state),
+            )
+        bar.n = progress.display_value(active_fractions)
         bar.set_postfix_str(progress.render().split("active=", 1)[1])
         bar.refresh()
 
@@ -202,8 +229,9 @@ def run_stage_tasks(
                 elapsed_seconds=result.elapsed_seconds,
             )
             unlink_with_retry(task.heartbeat_path)
+            active_fractions.pop(task.key, None)
             progress.complete(task.key, task.source_bytes, result.elapsed_seconds)
-            bar.update(task.source_bytes if progress.total_bytes else 1)
+            bar.n = progress.display_value(active_fractions)
             bar.set_postfix_str(progress.render().split("active=", 1)[1])
     finally:
         bar.close()

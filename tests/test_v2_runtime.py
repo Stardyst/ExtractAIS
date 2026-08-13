@@ -9,7 +9,7 @@ import pytest
 from extractais.config import load_config
 from extractais.isolated import IsolatedCall, run_isolated_many
 from extractais.pipeline import run_pipeline
-from extractais.runtime import heartbeat_phase_text
+from extractais.runtime import heartbeat_phase_text, heartbeat_progress_fraction
 from extractais.schema import normalized_day_sql
 from extractais.storage import ensure_space
 from test_v2_contract import _config, _ports, _raw_track
@@ -130,6 +130,13 @@ def test_heartbeat_reports_directory_progress_bytes(tmp_path: Path) -> None:
     assert text.startswith("2/4 compacting point-port shard 17/64")
     assert "out=3.00GiB" in text
     assert "free=" in text
+
+
+def test_heartbeat_phase_exposes_non_committed_display_progress() -> None:
+    assert heartbeat_progress_fraction({"phase": "1/8 loading"}) == 0
+    assert heartbeat_progress_fraction({"phase": "4/8 writing"}) == 0.375
+    assert heartbeat_progress_fraction({"phase": "committed"}) == 1
+    assert heartbeat_progress_fraction({"phase": "sorting"}) == 0
 
 
 def test_native_worker_crash_retries_same_task_with_safe_arguments(

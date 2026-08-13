@@ -1,4 +1,4 @@
-# ExtractAIS 2.1
+# ExtractAIS 2.2
 
 ExtractAIS 将按日 CSV 形式保存的超大规模 AIS 档案，转换为按 MMSI 和时间排序的年度船舶运行区间。v2 是不兼容重构：原始 CSV 每日只解析一次，动态信息和静态信息立即分离；船舶全量排序只执行一次；重任务按固定 MMSI 分区分布到独立物理盘。
 
@@ -13,7 +13,7 @@ python -m pip install -e .
 python -c "import duckdb, extractais; print(extractais.__version__, duckdb.__version__)"
 ```
 
-版本必须是 `ExtractAIS 2.1.0`、`DuckDB 1.5.4`。已有环境升级：
+版本必须是 `ExtractAIS 2.2.0`、`DuckDB 1.5.4`。已有环境升级：
 
 ```powershell
 git pull origin main
@@ -95,9 +95,11 @@ extractais --config configs/production.yaml validate
 | `intervals` | 五状态分类、长中断、连续状态压缩、年度裁切 | 固定分区 |
 | `validate` | 港口覆盖、歧义、Harbor Size、状态和证据汇总 | 固定分区 + 全局汇总 |
 
+`run-all` 到 `validate` 为止。高成本深度质量审计是独立命令，不会在常规重跑时自动执行；完整流程成功后按第 10 节运行一次即可。
+
 ## 5. 进度与恢复
 
-进度条只按已经原子提交并写入 SQLite 的源字节推进，不把扫描中的估算字节当作完成量。例如：
+进度条同时显示两种状态：条形百分比按分区心跳中的内部阶段保守推进，SQLite 检查点和 ETA 吞吐样本只认原子提交完成。例如：
 
 ```text
 tracks: 85%|...| 452G/535G [28:08:05, active=0866:3/5 trajectory sequencing out=0.31GiB free=8.42TiB ETA 10:12:30]
@@ -109,7 +111,7 @@ tracks: 85%|...| 452G/535G [28:08:05, active=0866:3/5 trajectory sequencing out=
 - `out` 是当前阶段已经写出的临时文件大小，`free` 是该阶段目标盘实时可用空间；二者变化可用于区分长查询与停滞。
 - ETA 至少完成 3 个工作单元后才显示；此前显示 `ETA calibrating n/3`。
 - ETA 基于已提交工作单元的实际字节吞吐，不使用“首个任务瞬间完成”造成的虚假速度。
-- 一个分区可能运行较久，百分比只在它提交后跳动，这是提交语义，不是停滞。
+- 一个分区运行时，条形进度会按 `n/N` 内部阶段移动；中断后仍从该分区开头重做，只有提交后的分区可以跳过。
 - 某日并行 CSV reader 若被 Windows 原生层终止，该日会自动使用显式 schema 的单线程 reader 重试一次；已完成日期不会重算，解析规则不变。
 
 可随时 `Ctrl+C` 停止，再执行同一命令。`state.sqlite` 同时验证参数签名和输出文件存在性；未提交的 `.tmp` 不会被当成成功结果。查看状态：
@@ -135,7 +137,7 @@ extractais --config configs/production.yaml run-all 2>&1 |
   Tee-Object -FilePath logs/run-all-v2-resume.log
 ```
 
-应输出 `2.1.0 1.5.4`。2.1.0 保持 `tracks` 的任务签名和最终 Parquet 契约不变，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
+应输出 `2.2.0 1.5.4`。2.2.0 不改变 `tracks` 的任务签名和最终 Parquet 契约，因此已提交分区直接跳过；失败分区遗留的 `.tmp.parquet` 和 `D:\ExtractAIS-v2-temp\tracks-NNNN` 会在该分区启动时清理。`ingest` 已有检查点和每日 run 会直接复用。
 
 ### 从 2.0.2 的 geometry 候选爆炸恢复
 
@@ -214,6 +216,7 @@ products/validation/ambiguous_port_points.parquet
 - `*/ingest_runs`：全部 tracks 完成后自动删除，也可用 `cleanup-staging`；命令会先验证全部轨迹检查点。
 - `point_port_candidates`、`point_group_candidates`、`port_context`：属于可重建证据，但删除后 `status` 会识别输出缺失；后续阶段不能独立复用。
 - `products/validation`：可重建报告。
+- `products/quality_audit`：可重建的深度审计报告和断点 partials，不属于最终轨迹数据；删除后再次执行 `audit-quality` 会从头重建审计，但不会重跑主流程。
 - canonical tracks、port calls 和最终 intervals 是主要保留结果，不应当作临时文件删除。
 
 ## 9. 只读诊断
@@ -226,5 +229,41 @@ powershell -ExecutionPolicy Bypass -File scripts/diagnose_pipeline.ps1 `
 ```
 
 脚本只读取进程、物理盘性能、心跳、检查点和可用空间，不修改数据或进程状态。输出用于判断 CPU、内存、物理盘吞吐、队列以及当前活动子阶段。
+
+## 10. 深度质量审计
+
+现有 `state_summary.csv` 和 `port_quality.csv` 是快速验证报告：区间只要包含一个异常点，整段就会标记异常；港口调用只要包含一个歧义点，整次调用就会标记歧义。因此不能把其中的区间点数或调用数直接解释为错误率。
+
+完整流程成功且 `validate` 已完成后运行：
+
+```powershell
+New-Item -ItemType Directory -Force logs | Out-Null
+extractais --config configs/production.yaml audit-quality 2>&1 |
+  Tee-Object -FilePath logs/audit-quality-v2.log
+```
+
+该命令不扫描原始 CSV 清单，也不修改 canonical tracks、港口调用、区间或 validation 结果。它按固定 MMSI 分区运行并写入同一个 `state.sqlite`，可随时 `Ctrl+C` 后用相同命令续跑。轨迹冲突阶段在 F/G 各运行一个任务；调用与区间证据位于产品盘，因此一次只运行一个重任务。空间保护在每个分区和全局合并前执行。
+
+结果位于 `H:\ExtractAIS-v2\products\quality_audit`：
+
+| 文件 | 用途 |
+|---|---|
+| `summary.json` | 口径、核心计数、路径和解释边界 |
+| `time_conflict_summary.csv` | 真正的 AIS 点级同秒冲突比例 |
+| `time_conflict_extent_bins.csv` | 同秒坐标包围盒对角距离代理量分层，区分近重复和远距离矛盾 |
+| `time_conflict_examples.parquet` | 各距离层的高风险同秒样本 |
+| `unknown_gap_duration.csv` | 按 6–12 小时、12–24 小时、1–3 天等统计中断时长 |
+| `unknown_gap_coverage.csv` | 船舶年度活跃时间窗中的中断时间占比 |
+| `state_transitions.csv` | 合并相邻同状态后得到的状态转移矩阵 |
+| `interval_flag_propagation.csv` | 异常点经 `bool_or` 扩展到整段后的区间、点数和时长 |
+| `ambiguity_assignment.csv` | 全部歧义候选点中位于确认港口调用内的覆盖比例 |
+| `call_ambiguity_distribution.csv` | 每次调用中歧义点占比的分布，而非“一点即整次歧义” |
+| `port_call_quality.csv` | 各港口组的调用级和点级歧义率、阈值敏感性及生命周期完整率 |
+| `call_lifecycle.csv` | `ARRIVING/IN_PORT/DEPARTING` 是否围绕同一调用完整出现 |
+| `competing_port_pairs.csv` | 歧义最集中的有向港口组对、距离、国家和 Harbor Size |
+| `review_calls.parquet` | 高歧义比例、高歧义点数和低歧义对照调用的确定性样本 |
+| `review_ambiguous_points.parquet` | 样本调用的代表 AIS 点及两个候选港口组坐标和距离 |
+
+建议按以下顺序判断：先确认 `ambiguity_flag_mismatch_count` 接近零，验证调用歧义重算与原标签一致；再比较调用歧义率与调用内歧义点率；随后查看 `competing_port_pairs.csv` 的集中程度；最后在 QGIS/Python 中人工复核两个 `review_*.parquet`。`ambiguity_assignment.csv` 的未分配点通常是未形成确认调用的港口候选点，不要求达到 100%。这些报告只衡量内部一致性和证据集中度，没有人工标签时仍不能称为港口识别准确率。
 
 完整算法和失效边界见 [docs/pipeline.md](docs/pipeline.md)。

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from extractais import __version__
+from extractais.audit import build_quality_audit
 from extractais.calls import build_calls
 from extractais.checkpoints import CheckpointStore
 from extractais.config import AppConfig, load_config
@@ -31,6 +32,9 @@ STAGES = (
     "intervals",
     "validation_partials",
     "validation",
+    "quality_audit_tracks",
+    "quality_audit_behavior",
+    "quality_audit",
 )
 
 
@@ -49,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("calls", help="confirm port calls from geometry and port groups")
     commands.add_parser("intervals", help="build annual five-state trajectory intervals")
     commands.add_parser("validate", help="build accuracy evidence and quality summaries")
+    commands.add_parser(
+        "audit-quality",
+        help="read completed products and build deeper quality diagnostics",
+    )
     commands.add_parser("run-all", help="run or resume the complete v2 pipeline")
     status = commands.add_parser("status", help="show checkpoints, storage, and output paths")
     status.add_argument("--json", action="store_true", help="emit machine-readable JSON")
@@ -108,6 +116,7 @@ def _status(config: AppConfig) -> dict[str, object]:
             "trajectory_intervals": str(config.storage.products_root / "trajectory_intervals"),
             "port_calls": str(config.storage.products_root / "port_calls"),
             "validation": str(config.storage.products_root / "validation"),
+            "quality_audit": str(config.storage.products_root / "quality_audit"),
             "state": str(state),
         },
     }
@@ -149,6 +158,10 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.command == "status":
         _print_status(_status(config), args.json)
+        return
+    if args.command == "audit-quality":
+        _with_store(config, lambda store: build_quality_audit(config, store))
+        _print_status(_status(config), False)
         return
     if args.command == "inventory":
         inventory, inventory_hash = _inventory(config)

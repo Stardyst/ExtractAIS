@@ -225,6 +225,8 @@ def test_progress_uses_committed_bytes_and_calibrates_eta() -> None:
     progress.start("0000", 250, "sorting")
     assert progress.completed_bytes == 0
     assert progress.percent == 0
+    assert progress.display_value({"0000": 0.4}) == 100
+    assert progress.completed_bytes == 0
     assert "active=0000:sorting" in progress.render()
     assert "ETA calibrating 0/3" in progress.render()
 

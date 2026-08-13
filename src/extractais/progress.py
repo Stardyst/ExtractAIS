@@ -20,6 +20,7 @@ class StageProgress:
     completed_tasks: int = 0
     started_at: float = field(default_factory=time.monotonic)
     active: dict[str, tuple[str, float]] = field(default_factory=dict)
+    active_bytes: dict[str, int] = field(default_factory=dict)
     samples: list[tuple[int, float]] = field(default_factory=list)
 
     @property
@@ -32,6 +33,7 @@ class StageProgress:
 
     def start(self, task_key: str, source_bytes: int, phase: str = "starting") -> None:
         self.active[task_key] = (phase, time.monotonic())
+        self.active_bytes[task_key] = max(0, int(source_bytes))
 
     def phase(self, task_key: str, phase: str) -> None:
         started = self.active.get(task_key, (phase, time.monotonic()))[1]
@@ -39,10 +41,28 @@ class StageProgress:
 
     def complete(self, task_key: str, source_bytes: int, elapsed_seconds: float) -> None:
         self.active.pop(task_key, None)
+        self.active_bytes.pop(task_key, None)
         self.completed_bytes += max(0, int(source_bytes))
         self.completed_tasks += 1
         if source_bytes > 0 and elapsed_seconds > 0:
             self.samples.append((int(source_bytes), float(elapsed_seconds)))
+
+    def display_value(self, active_fractions: dict[str, float]) -> int:
+        """Include heartbeat estimates without changing committed progress state."""
+        if self.total_bytes > 0:
+            active_bytes = sum(
+                max(0.0, min(1.0, float(fraction)))
+                * self.active_bytes.get(key, 0)
+                for key, fraction in active_fractions.items()
+                if key in self.active
+            )
+            return min(self.total_bytes, int(self.completed_bytes + active_bytes))
+        active_tasks = sum(
+            max(0.0, min(1.0, float(fraction)))
+            for key, fraction in active_fractions.items()
+            if key in self.active
+        )
+        return min(self.total_tasks, int(self.completed_tasks + active_tasks))
 
     def _eta(self) -> str:
         if len(self.samples) < 3:

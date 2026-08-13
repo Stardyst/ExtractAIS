@@ -1,4 +1,4 @@
-# ExtractAIS v2.1 processing contract
+# ExtractAIS v2.2 processing contract
 
 ## Invariants
 
@@ -8,7 +8,7 @@
 4. A partition is permanently assigned to one track root and one evidence root.
 5. One heavy worker runs per physical track disk. DuckDB thread, memory, and spill limits are explicit.
 6. Only an atomically renamed output plus a durable SQLite row is complete.
-7. Progress counts committed source bytes; heartbeats report uncommitted internal phases.
+7. Checkpoints and ETA samples count committed source bytes; the visible bar may include conservative internal-phase progress from heartbeats.
 
 ## Data flow
 
@@ -28,6 +28,7 @@ flowchart LR
   PG --> CA
   CA --> IV["Annual trajectory intervals on H"]
   IV --> VA["Validation evidence"]
+  VA --> QA["Read-only deep quality audit"]
 ```
 
 ## Stage semantics
@@ -73,6 +74,7 @@ Observation gaps above `unknown_gap_hours` are explicit `UNKNOWN_GAP` rows. Cons
 | Port grouping or excluded harbor size | `port_groups`, then calls |
 | Call confirmation rules | `calls` |
 | Unknown-gap threshold | `intervals` |
+| Any audited track/call/interval/validation input | matching `quality_audit` partition |
 
 Signatures propagate through dependency file identities. Geometry depends on anchors and radii, not port groups; this is the key boundary that makes port-group iteration inexpensive.
 
@@ -95,3 +97,18 @@ Before excluding small ports, retain and compare:
 - interval state and quality-flag counts.
 
 AIS gaps are not inferred in v2. Long gaps are always `UNKNOWN_GAP`, preserving an auditable base for a separate future inference model.
+
+## Quality-audit contract
+
+`audit-quality` is intentionally outside `run-all`. It reads completed canonical tracks, validation ambiguity partials, port calls, annual intervals and port groups. Source products are never rewritten. Per-partition summaries are atomically committed under `products/quality_audit/partials`; a global merge produces compact CSV reports and bounded Parquet review samples.
+
+The audit separates four grains that the fast validation reports combine:
+
+1. AIS point and same-second timestamp groups for time conflicts.
+2. Ambiguous AIS points assigned back to confirmed port calls.
+3. Confirmed calls and their `ARRIVING → IN_PORT → DEPARTING` lifecycle coverage.
+4. Compressed state intervals and vessel-year elapsed-time coverage.
+
+Same-second spatial extent is the Haversine diagonal of the coordinate bounding box. It is a separation proxy, not an exact pairwise diameter or mathematical bound. Call ambiguity is reported both as calls containing at least one ambiguous point and as ambiguous points divided by all call points. Unknown gaps are reported as elapsed seconds divided by each vessel-year active span, never as row-count share.
+
+Review evidence is bounded. Each track partition contributes only the strongest call candidates; each selected call contributes at most ten closest-margin points and five points from each temporal boundary. The global sample retains at most 200 calls per review stratum. No port groups are automatically merged by the audit.
